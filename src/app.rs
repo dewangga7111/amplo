@@ -1,7 +1,7 @@
 //! The state of the player, and everything it does apart from drawing.
 
 use std::{
-    collections::{HashMap, hash_map::RandomState},
+    collections::{HashMap, HashSet, hash_map::RandomState},
     fs,
     hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
@@ -40,8 +40,19 @@ const NO_AUDIO: &str = "No audio files found in that folder.";
 pub struct Queue {
     /// `None` once a rescan finds that the playlist no longer exists.
     pub playlist: Option<usize>,
+    /// The playlist's own order, which comes back when shuffle turns off.
+    pub original: Vec<usize>,
+    /// The play order, decided before playback starts. Next, Previous, and the end of a
+    /// track all walk this list, so going back always finds the song played before.
     pub tracks: Vec<usize>,
     pub position: usize,
+}
+
+/// What the card beside the cover shows in Now Playing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum CardTab {
+    Lyrics,
+    Queue,
 }
 
 pub enum Action {
@@ -50,8 +61,11 @@ pub enum Action {
     Previous,
     PlayRow(usize),
     PlayView,
-    /// Starts the shown playlist at a random song. The order after it stays as set.
-    PlayViewFromRandom,
+    /// Turns shuffle on and plays the shown playlist in a new random order.
+    ShufflePlayView,
+    /// Jumps to a song in the queue. Its order stays as it is.
+    PlayQueue(usize),
+    ShowCardTab(CardTab),
     OpenPlaylist(usize),
     Expand,
     Minimize,
@@ -97,6 +111,7 @@ pub struct App {
     pub view: usize,
     pub queue: Option<Queue>,
     pub minimized: bool,
+    pub card_tab: CardTab,
     pub shuffle: bool,
     pub repeat: bool,
     pub settings: Settings,
@@ -125,6 +140,8 @@ pub struct App {
     pub error: Option<String>,
     pub slide: f32,
     pub mini: f32,
+    /// When long titles in Now Playing started from their beginning, in UI time.
+    pub marquee_started: f64,
     window_title: String,
 }
 
@@ -175,6 +192,24 @@ fn random_below(limit: usize) -> usize {
     (RandomState::new().build_hasher().finish() % limit.max(1) as u64) as usize
 }
 
+/// Returns `tracks` in a random order. With `first`, the song at that index goes in front.
+fn shuffled(tracks: &[usize], first: Option<usize>) -> Vec<usize> {
+    let mut order = tracks.to_vec();
+    let start = match first {
+        Some(index) if index < order.len() => {
+            order.swap(0, index);
+            1
+        }
+        _ => 0,
+    };
+    // Fisher-Yates: every order of the remaining songs is equally likely.
+    let count = order.len();
+    for index in start..count.saturating_sub(1) {
+        order.swap(index, index + random_below(count - index));
+    }
+    order
+}
+
 impl App {
     pub fn new(
         ctx: egui::Context,
@@ -192,6 +227,7 @@ impl App {
             view: ALL_SONGS,
             queue: None,
             minimized: true,
+            card_tab: CardTab::Lyrics,
             shuffle: false,
             repeat: false,
             settings,
@@ -217,6 +253,7 @@ impl App {
             error: None,
             slide: 0.0,
             mini: 0.0,
+            marquee_started: 0.0,
             window_title: APP_NAME.to_owned(),
         };
         if !startup_paths.is_empty() {
@@ -352,16 +389,30 @@ impl App {
                 removed = Some(self.library.tracks[queue.tracks[queue.position]].info.title.clone());
                 return None;
             };
+            let remap = |old: &[usize]| -> Vec<usize> {
+                old.iter()
+                    .filter_map(|&track| positions.get(self.library.tracks[track].path.as_path()).copied())
+                    .collect()
+            };
             let playlist = queue.playlist.and_then(playlist_named);
-            let tracks = playlist
+            let original = playlist
                 .map(|index| library.playlists[index].tracks.clone())
                 .filter(|tracks| tracks.contains(&current))
-                .unwrap_or_else(|| {
-                    let old = queue.tracks.iter();
-                    old.filter_map(|&track| positions.get(self.library.tracks[track].path.as_path()).copied()).collect()
-                });
+                .unwrap_or_else(|| remap(&queue.original));
+            let tracks = if self.shuffle {
+                // The order so far stays, so Previous still works. New songs join at the end.
+                let wanted: HashSet<usize> = original.iter().copied().collect();
+                let mut order = remap(&queue.tracks);
+                order.retain(|track| wanted.contains(track));
+                let known: HashSet<usize> = order.iter().copied().collect();
+                let new_songs: Vec<usize> = wanted.difference(&known).copied().collect();
+                order.extend(shuffled(&new_songs, None));
+                order
+            } else {
+                original.clone()
+            };
             let position = tracks.iter().position(|&track| track == current)?;
-            Some(Queue { playlist, tracks, position })
+            Some(Queue { playlist, original, tracks, position })
         });
 
         if let Some(title) = removed {
@@ -392,7 +443,7 @@ impl App {
             self.save_settings();
         }
         if autoplay {
-            self.play_view(0);
+            self.play_view(None);
             self.minimized = false;
         }
     }
@@ -424,14 +475,36 @@ impl App {
         self.seek_preview.unwrap_or(played)
     }
 
-    /// Starts a row of the shown playlist, and makes that playlist the queue.
-    fn play_view(&mut self, row: usize) {
+    /// Makes the shown playlist the queue and starts it, at the given row or else from the
+    /// top of the play order. On shuffle, this decides a new random order first.
+    fn play_view(&mut self, first_row: Option<usize>) {
         let Some(playlist) = self.library.playlists.get(self.view) else { return };
-        if row >= playlist.tracks.len() {
+        let original = playlist.tracks.clone();
+        if original.is_empty() || first_row.is_some_and(|row| row >= original.len()) {
             return;
         }
-        self.queue = Some(Queue { playlist: Some(self.view), tracks: playlist.tracks.clone(), position: row });
-        self.play_at(row);
+        let (tracks, position) = if self.shuffle {
+            (shuffled(&original, first_row), 0)
+        } else {
+            (original.clone(), first_row.unwrap_or(0))
+        };
+        self.queue = Some(Queue { playlist: Some(self.view), original, tracks, position });
+        self.play_at(position);
+    }
+
+    /// Reorders the queue around the current song, which keeps playing.
+    fn toggle_shuffle(&mut self) {
+        self.shuffle = !self.shuffle;
+        let shuffle = self.shuffle;
+        let Some(queue) = &mut self.queue else { return };
+        let Some(&current) = queue.tracks.get(queue.position) else { return };
+        if shuffle {
+            queue.tracks = shuffled(&queue.tracks, Some(queue.position));
+            queue.position = 0;
+        } else {
+            queue.tracks.clone_from(&queue.original);
+            queue.position = queue.tracks.iter().position(|&track| track == current).unwrap_or(0);
+        }
     }
 
     fn play_at(&mut self, position: usize) {
@@ -439,6 +512,7 @@ impl App {
         self.duration = None;
         self.seek_preview = None;
         self.lyric_motion = LyricMotion::default();
+        self.restart_marquee();
         let Some(queue) = &mut self.queue else { return };
         queue.position = position;
         let Some(&track) = queue.tracks.get(position) else { return };
@@ -451,6 +525,10 @@ impl App {
         let started = self.start(&path);
         self.tech = tech_lines(&path, &info, started.as_ref().ok().copied(), self.duration);
         self.error = started.err().map(|err| format!("{}: {err}", info.title));
+    }
+
+    fn restart_marquee(&mut self) {
+        self.marquee_started = self.ctx.input(|input| input.time);
     }
 
     /// Returns the sample rate and channel count of the decoded audio.
@@ -489,24 +567,14 @@ impl App {
             Some(player) => player.pause(),
             None => match &self.queue {
                 Some(queue) => self.play_at(queue.position),
-                None => self.play_view(0),
+                None => self.play_view(None),
             },
-        }
-    }
-
-    /// The next position: in order and wrapping around, or any other track on shuffle.
-    fn following_position(&self, from: usize, len: usize) -> usize {
-        if self.shuffle && len > 1 {
-            (from + 1 + random_below(len - 1)) % len
-        } else {
-            (from + 1) % len
         }
     }
 
     fn next(&mut self) {
         let Some(queue) = &self.queue else { return };
-        let position = self.following_position(queue.position, queue.tracks.len());
-        self.play_at(position);
+        self.play_at((queue.position + 1) % queue.tracks.len());
     }
 
     fn previous(&mut self) {
@@ -531,7 +599,7 @@ impl App {
         }
         let mut skipped = None;
         for _ in 0..len {
-            position = self.following_position(position, len);
+            position = (position + 1) % len;
             self.play_at(position);
             if self.player.is_some() {
                 self.error = skipped;
@@ -583,20 +651,25 @@ impl App {
             Action::Toggle => self.toggle(),
             Action::Next => self.next(),
             Action::Previous => self.previous(),
-            Action::PlayRow(row) => self.play_view(row),
-            Action::PlayView => self.play_view(0),
-            Action::PlayViewFromRandom => {
-                let count = self.library.playlists.get(self.view).map_or(0, |playlist| playlist.tracks.len());
-                self.play_view(random_below(count));
+            Action::PlayRow(row) => self.play_view(Some(row)),
+            Action::PlayView => self.play_view(None),
+            Action::ShufflePlayView => {
+                self.shuffle = true;
+                self.play_view(None);
             }
+            Action::PlayQueue(position) => self.play_at(position),
+            Action::ShowCardTab(tab) => self.card_tab = tab,
             Action::OpenPlaylist(index) => {
                 self.view = index;
                 self.minimized = true;
             }
-            Action::Expand => self.minimized = false,
+            Action::Expand => {
+                self.minimized = false;
+                self.restart_marquee();
+            }
             Action::Minimize => self.minimized = true,
             Action::ToggleLike => self.toggle_like(),
-            Action::ToggleShuffle => self.shuffle = !self.shuffle,
+            Action::ToggleShuffle => self.toggle_shuffle(),
             Action::ToggleRepeat => self.repeat = !self.repeat,
             Action::OpenFolder => self.open_folder(),
             Action::Seek(seconds) => self.seek(seconds),
@@ -646,6 +719,21 @@ mod tests {
         assert_eq!(format_time(5.9), "0:05");
         assert_eq!(format_time(65.0), "1:05");
         assert_eq!(format_time(3725.0), "1:02:05");
+    }
+
+    #[test]
+    fn shuffling_keeps_every_song_and_puts_the_chosen_one_first() {
+        let tracks: Vec<usize> = (10..40).collect();
+        let order = shuffled(&tracks, Some(7));
+        assert_eq!(order[0], 17);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, tracks);
+
+        let orders: HashSet<Vec<usize>> = (0..20).map(|_| shuffled(&tracks, None)).collect();
+        assert!(orders.len() > 1, "the order never changed");
+        assert!(shuffled(&[], None).is_empty());
+        assert_eq!(shuffled(&[5], Some(0)), [5]);
     }
 
     #[test]

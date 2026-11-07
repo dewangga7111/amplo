@@ -24,7 +24,6 @@ pub const LIKED_SONGS: usize = 1;
 pub struct TrackInfo {
     pub title: String,
     pub artist: String,
-    pub album: String,
     pub duration: Option<Duration>,
     pub bitrate_kbps: Option<u32>,
     pub sample_rate: Option<u32>,
@@ -100,7 +99,6 @@ pub fn read_info(path: &Path) -> TrackInfo {
         };
         set(&mut info.title, tag.title());
         set(&mut info.artist, tag.artist());
-        set(&mut info.album, tag.album());
     }
     info
 }

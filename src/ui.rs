@@ -8,10 +8,10 @@ use eframe::egui::{
 use amplo::library::{ALL_SONGS, LIKED_SONGS, Playlist};
 
 use crate::{
-    app::{APP_NAME, Action, App, VISUALIZER_BARS, format_time},
+    app::{APP_NAME, Action, App, CardTab, VISUALIZER_BARS, format_time},
     theme,
     widgets::{
-        IconButton, accent_button, at, click_area, line, paint_edge_fades, paint_equalizer, paint_icon,
+        IconButton, accent_button, at, click_area, line, marquee, paint_edge_fades, paint_equalizer, paint_icon,
         paint_shadow, paint_text, paint_texture, paint_two_lines, slider, spaced_line,
     },
 };
@@ -24,6 +24,8 @@ const ROW_HEIGHT: f32 = 40.0;
 const ROWS_TOP: f32 = 77.0;
 const LIST_BOTTOM_SPACE: f32 = 80.0;
 const NAV_STEP: f32 = 46.0;
+const QUEUE_HEADING: f32 = 24.0;
+const QUEUE_ROW: f32 = 46.0;
 const LYRIC_HEIGHT: f32 = 46.0;
 /// One size for all lines. Only the color changes, so text never resizes or rewraps.
 const LYRIC_FONT_SIZE: f32 = 17.0;
@@ -46,16 +48,6 @@ fn ease(value: &mut f32, target: f32, rate: f32, dt: f32) {
 
 fn plural_songs(count: usize) -> String {
     if count == 1 { "1 song".to_owned() } else { format!("{count} songs") }
-}
-
-/// The visible part of an optional artist and album.
-fn artist_and_album(artist: &str, album: &str) -> String {
-    match (artist.is_empty(), album.is_empty()) {
-        (false, false) => format!("{artist} · {album}"),
-        (false, true) => artist.to_owned(),
-        (true, false) => album.to_owned(),
-        (true, true) => "Unknown artist".to_owned(),
-    }
 }
 
 impl App {
@@ -366,8 +358,8 @@ impl App {
         paint_two_lines(ui, left, origin.y + 36.0, 2.0, title, subtitle);
 
         let shuffle = IconButton::round(theme::SHUFFLE, 16.0, theme::TEXT);
-        if shuffle.show(ui, random, "Play from a random song").clicked() {
-            actions.push(Action::PlayViewFromRandom);
+        if shuffle.show(ui, random, "Shuffle play").clicked() {
+            actions.push(Action::ShufflePlayView);
         }
         if accent_button(ui, play, theme::PLAY, 16.0, "Play playlist").clicked() {
             actions.push(Action::PlayView);
@@ -463,20 +455,20 @@ impl App {
         let time = spaced_line(ui, &time, theme::mono_semibold(26.0), theme::ACCENT, f32::INFINITY, -0.52);
         paint_text(ui, Align2::RIGHT_CENTER, pos2(info_right, info_bottom - 45.0 - 4.0 - 13.0), time);
 
+        let elapsed = ui.input(|input| input.time) - self.marquee_started;
         let info = &self.library.tracks[track].info;
-        let title = line(ui, &info.title, theme::grotesk_bold(19.0), theme::TEXT, column);
-        let title_bottom = cover.bottom() + 10.0 + title.size().y;
-        ui.painter().galley(pos2(left, cover.bottom() + 10.0), title, Color32::PLACEHOLDER);
-        let subtitle = artist_and_album(&info.artist, &info.album);
-        let subtitle = line(ui, &subtitle, theme::inter(13.0), theme::SOFT, column);
-        let subtitle_bottom = title_bottom + 2.0 + subtitle.size().y;
-        ui.painter().galley(pos2(left, title_bottom + 2.0), subtitle, Color32::PLACEHOLDER);
+        let title_top = cover.bottom() + 10.0;
+        let title_height =
+            marquee(ui, pos2(left, title_top), column, &info.title, theme::grotesk_bold(19.0), theme::TEXT, elapsed);
+        let artist = if info.artist.is_empty() { "Unknown artist" } else { &info.artist };
+        let artist_top = title_top + title_height + 2.0;
+        let artist_height = marquee(ui, pos2(left, artist_top), column, artist, theme::inter(13.0), theme::SOFT, elapsed);
 
-        let bars_top = subtitle_bottom + 10.0;
+        let bars_top = artist_top + artist_height + 10.0;
         self.draw_visualizer(ui, Rect::from_min_size(pos2(left, bars_top), vec2(column, 26.0)));
 
         let lyrics = Rect::from_min_max(pos2(left + column + 14.0, top), pos2(content.right(), cards_bottom));
-        self.draw_lyrics(ui, lyrics, dt);
+        self.draw_card(ui, lyrics, dt, actions);
         self.draw_transport(ui, content, transport_top, track, actions);
     }
 
@@ -512,12 +504,120 @@ impl App {
         motion.moving = motion.mix < 1.0 || *scroll != target;
     }
 
-    fn draw_lyrics(&mut self, ui: &mut Ui, card: Rect, dt: f32) {
+    /// The card beside the cover, with its tabs for lyrics and the queue.
+    fn draw_card(&mut self, ui: &mut Ui, card: Rect, dt: f32, actions: &mut Vec<Action>) {
         ui.painter().rect(card, 12.0, theme::PANEL, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
         let inner = card.shrink2(vec2(17.0, 15.0));
-        let heading = spaced_line(ui, "LYRICS", theme::inter_semibold(10.0), theme::MUTED, 100.0, 1.0);
-        paint_text(ui, Align2::LEFT_TOP, inner.min, heading);
 
+        let mut tab_left = inner.left();
+        for (tab, title, label) in [(CardTab::Lyrics, "LYRICS", "Lyrics"), (CardTab::Queue, "QUEUE", "Queue")] {
+            let galley = spaced_line(ui, title, theme::inter_semibold(10.0), Color32::PLACEHOLDER, 100.0, 1.0);
+            let text = Rect::from_min_size(pos2(tab_left, inner.top()), galley.size());
+            let response = click_area(ui, text.expand2(vec2(5.0, 7.0)), label);
+            let active = self.card_tab == tab;
+            let color = if active {
+                theme::TEXT
+            } else if response.hovered() {
+                theme::SOFT
+            } else {
+                theme::MUTED
+            };
+            ui.painter().galley(text.min, galley, color);
+            if active {
+                let line = Rect::from_x_y_ranges(text.x_range(), text.bottom() + 2.0..=text.bottom() + 4.0);
+                ui.painter().rect_filled(line, 1.0, theme::ACCENT);
+            }
+            if response.clicked() {
+                actions.push(Action::ShowCardTab(tab));
+            }
+            tab_left = text.right() + 14.0;
+        }
+
+        match self.card_tab {
+            CardTab::Lyrics => self.draw_lyrics(ui, inner, dt),
+            CardTab::Queue => {
+                // The lyrics do not animate while hidden, so nothing is left to wait for.
+                self.lyric_motion.moving = false;
+                let view = Rect::from_min_max(
+                    pos2(card.left() + 8.0, inner.top() + 22.0),
+                    pos2(card.right() - 8.0, card.bottom() - 8.0),
+                );
+                self.draw_queue(ui, view, actions);
+            }
+        }
+    }
+
+    fn draw_queue(&mut self, ui: &mut Ui, view: Rect, actions: &mut Vec<Action>) {
+        let Some(queue) = &self.queue else { return };
+        let (position, count) = (queue.position, queue.tracks.len());
+        let source = queue.playlist.and_then(|index| self.library.playlists.get(index));
+        let next_heading = source.map_or_else(|| "Next in queue".to_owned(), |playlist| format!("Next from: {}", playlist.name));
+        let next_top = QUEUE_HEADING + QUEUE_ROW + 8.0 + QUEUE_HEADING;
+        let upcoming = count.saturating_sub(1);
+        let total = next_top + upcoming as f32 * QUEUE_ROW + 8.0;
+
+        ui.scope_builder(UiBuilder::new().id_salt("queue").max_rect(view), |ui| {
+            ui.set_clip_rect(ui.clip_rect().intersect(view));
+            // A new position starts at the top, where the song that plays now is.
+            ScrollArea::vertical()
+                .id_salt(("queue-scroll", position))
+                .auto_shrink(false)
+                .scroll_source(ScrollSource::MOUSE_WHEEL | ScrollSource::SCROLL_BAR)
+                .show_viewport(ui, |ui, viewport| {
+                    let origin = ui.max_rect().min;
+                    let width = view.width();
+                    ui.set_min_size(vec2(width, total));
+
+                    let heading = |ui: &Ui, top: f32, text: &str| {
+                        let galley = line(ui, text, theme::grotesk_semibold(13.0), theme::TEXT, width - 18.0);
+                        paint_text(ui, Align2::LEFT_CENTER, origin + vec2(9.0, top + QUEUE_HEADING / 2.0), galley);
+                    };
+                    heading(ui, 0.0, "Now playing");
+                    if let Some(current) = self.current_track() {
+                        let rect = at(origin, 0.0, QUEUE_HEADING, width, QUEUE_ROW);
+                        self.paint_queue_track(ui, rect, current, theme::ACCENT);
+                    }
+                    if upcoming == 0 {
+                        return;
+                    }
+                    heading(ui, QUEUE_HEADING + QUEUE_ROW + 8.0, &next_heading);
+
+                    let first = ((viewport.top() - next_top) / QUEUE_ROW).floor().max(0.0) as usize;
+                    let last = (((viewport.bottom() - next_top) / QUEUE_ROW).ceil().max(0.0) as usize).min(upcoming);
+                    for row in first..last {
+                        // The queue wraps around, so the songs before this one follow at the end.
+                        let target = (position + 1 + row) % count;
+                        let Some(track) = self.queue.as_ref().map(|queue| queue.tracks[target]) else { return };
+                        let rect = at(origin, 0.0, next_top + row as f32 * QUEUE_ROW, width, QUEUE_ROW);
+                        let label = format!("Queue: {}", self.library.tracks[track].info.title);
+                        let response = click_area(ui, rect, &label);
+                        if response.hovered() {
+                            ui.painter().rect_filled(rect, 8.0, theme::NAV_HOVER);
+                        }
+                        if response.clicked() {
+                            actions.push(Action::PlayQueue(target));
+                        }
+                        self.paint_queue_track(ui, rect, track, theme::TEXT);
+                    }
+                });
+        });
+    }
+
+    fn paint_queue_track(&mut self, ui: &Ui, rect: Rect, track: usize, title_color: Color32) {
+        let center_y = rect.center().y;
+        let cover = Rect::from_center_size(pos2(rect.left() + 27.0, center_y), Vec2::splat(36.0));
+        let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
+        paint_texture(ui, cover, texture, 7);
+
+        let info = &self.library.tracks[track].info;
+        let left = cover.right() + 10.0;
+        let width = (rect.right() - 9.0 - left).max(0.0);
+        let title = line(ui, &info.title, theme::inter_semibold(13.0), title_color, width);
+        let artist = line(ui, &info.artist, theme::inter(11.0), theme::SOFT, width);
+        paint_two_lines(ui, left, center_y, 1.0, title, artist);
+    }
+
+    fn draw_lyrics(&mut self, ui: &mut Ui, inner: Rect, dt: f32) {
         let Some(lyrics) = &self.lyrics else {
             let center = inner.center();
             paint_icon(ui, Rect::from_center_size(center - vec2(0.0, 36.0), Vec2::splat(28.0)), theme::NOTE, theme::SOFT);

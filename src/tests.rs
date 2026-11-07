@@ -13,7 +13,7 @@ use egui_kittest::{Harness, kittest::Queryable};
 use amplo::{lyrics::Lyrics, settings::Settings};
 
 use crate::{
-    app::{Action, App},
+    app::{Action, App, CardTab},
     ui::WINDOW_SIZE,
 };
 
@@ -286,23 +286,6 @@ fn repeat_plays_the_same_track_again() {
 }
 
 #[test]
-fn shuffle_never_picks_the_same_track() {
-    let folder = TestFolder::new("shuffle");
-    let mut harness = harness_for(&folder);
-    click(&mut harness, "1. a short");
-    click(&mut harness, "Expand");
-    click(&mut harness, "Shuffle");
-    assert!(harness.state().shuffle);
-    let mut title = current_title(&harness);
-    for _ in 0..12 {
-        click(&mut harness, "Next");
-        let next = current_title(&harness);
-        assert_ne!(next, title);
-        title = next;
-    }
-}
-
-#[test]
 fn like_saves_and_fills_the_liked_playlist() {
     let folder = TestFolder::new("like");
     let settings_path = folder.0.join("state.txt");
@@ -391,20 +374,154 @@ fn now_playing_minimizes_back_to_the_song_list() {
 }
 
 #[test]
-fn random_play_starts_somewhere_in_the_shown_playlist() {
+fn shuffle_play_builds_a_new_order_each_time() {
     let folder = TestFolder::new("random");
     let mut harness = harness_for(&folder);
     click(&mut harness, "Mix");
 
     let mut starts = BTreeSet::new();
     for _ in 0..30 {
-        click(&mut harness, "Play from a random song");
+        click(&mut harness, "Shuffle play");
         starts.insert(current_title(&harness));
-        assert_eq!(harness.state().queue.as_ref().unwrap().playlist, Some(2));
+        let queue = harness.state().queue.as_ref().unwrap();
+        assert_eq!(queue.playlist, Some(2));
+        assert_eq!(queue.position, 0, "the order is decided before the first song");
     }
     assert_eq!(starts, BTreeSet::from(["a short".to_owned(), "c long".to_owned()]));
-    assert!(!harness.state().shuffle, "only the start is random");
+    assert!(harness.state().shuffle, "shuffle stays on");
     assert!(harness.state().minimized, "like a row click, it stays in the list");
+}
+
+fn play_order(harness: &Harness<'static, App>) -> Vec<usize> {
+    harness.state().queue.as_ref().unwrap().tracks.clone()
+}
+
+fn queue_position(harness: &Harness<'static, App>) -> usize {
+    harness.state().queue.as_ref().unwrap().position
+}
+
+#[test]
+fn next_and_previous_walk_the_shuffled_order() {
+    let folder = TestFolder::new("shuffle-walk");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    click(&mut harness, "Expand");
+    click(&mut harness, "Shuffle");
+
+    let order = play_order(&harness);
+    assert_eq!(harness.state().library.tracks[order[0]].info.title, "c long", "the playing song goes first");
+    assert_eq!(queue_position(&harness), 0);
+    assert!(!is_paused(&harness), "turning shuffle on must not restart the song");
+
+    click(&mut harness, "Next");
+    assert_eq!(harness.state().current_track(), Some(order[1]));
+    click(&mut harness, "Next");
+    assert_eq!(harness.state().current_track(), Some(order[2]));
+    click(&mut harness, "Previous");
+    assert_eq!(harness.state().current_track(), Some(order[1]), "back finds the song played before");
+    assert_eq!(play_order(&harness), order, "walking must not reshuffle");
+}
+
+#[test]
+fn back_after_a_track_ends_finds_the_song_before_it() {
+    let folder = TestFolder::new("shuffle-end");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "1. a short");
+    click(&mut harness, "Expand");
+    click(&mut harness, "Shuffle");
+    // a short, b short2, c long, in that order.
+    harness.state_mut().queue.as_mut().unwrap().tracks = vec![0, 1, 2];
+    harness.state_mut().queue.as_mut().unwrap().position = 0;
+
+    wait_until(&mut harness, "track end", |app| app.current_track() != Some(0));
+    assert_eq!(harness.state().current_track(), Some(1), "the end of a track follows the order");
+    click(&mut harness, "Previous");
+    assert_eq!(harness.state().current_track(), Some(0));
+}
+
+#[test]
+fn clicking_in_the_queue_keeps_the_order() {
+    let folder = TestFolder::new("queue-click");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    click(&mut harness, "Expand");
+    click(&mut harness, "Shuffle");
+    click(&mut harness, "Queue");
+    let order = play_order(&harness);
+
+    // The queue shows every other song, and not the one that plays now.
+    for &track in &order[1..] {
+        let title = harness.state().library.tracks[track].info.title.clone();
+        harness.get_by_label(&format!("Queue: {title}"));
+    }
+    assert!(harness.query_by_label("Queue: c long").is_none());
+
+    let target = harness.state().library.tracks[order[2]].info.title.clone();
+    click(&mut harness, &format!("Queue: {target}"));
+    assert_eq!(harness.state().current_track(), Some(order[2]));
+    assert_eq!(queue_position(&harness), 2);
+    assert_eq!(play_order(&harness), order, "a click in the queue must not reshuffle");
+}
+
+#[test]
+fn clicking_a_song_outside_the_queue_reshuffles() {
+    let folder = TestFolder::new("queue-outside");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "1. a short");
+    click(&mut harness, "Expand");
+    click(&mut harness, "Shuffle");
+    click(&mut harness, "Back to song list");
+
+    let mut orders = BTreeSet::new();
+    for _ in 0..20 {
+        click(&mut harness, "3. c long");
+        assert_eq!(current_title(&harness), "c long");
+        assert_eq!(queue_position(&harness), 0, "the clicked song goes first");
+        let order = play_order(&harness);
+        let mut sorted = order.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, [0, 1, 2, 3]);
+        orders.insert(order);
+    }
+    assert!(orders.len() > 1, "the order never changed");
+}
+
+#[test]
+fn turning_shuffle_off_restores_the_playlist_order() {
+    let folder = TestFolder::new("shuffle-off");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    click(&mut harness, "Expand");
+    click(&mut harness, "Shuffle");
+    click(&mut harness, "Shuffle");
+    assert!(!harness.state().shuffle);
+    assert_eq!(play_order(&harness), [0, 1, 2, 3]);
+    assert_eq!(queue_position(&harness), 2, "the same song keeps playing");
+    assert_eq!(current_title(&harness), "c long");
+}
+
+#[test]
+fn a_rescan_keeps_the_shuffled_order_and_adds_new_songs_after_it() {
+    let folder = TestFolder::new("shuffle-rescan");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    click(&mut harness, "Expand");
+    click(&mut harness, "Shuffle");
+    let titles = |harness: &Harness<'static, App>| -> Vec<String> {
+        let app = harness.state();
+        let queue = app.queue.as_ref().unwrap();
+        queue.tracks.iter().map(|&track| app.library.tracks[track].info.title.clone()).collect()
+    };
+    let before = titles(&harness);
+
+    write_silent_wav(&folder.0.join("e new.wav"), 0.2);
+    wait_until(&mut harness, "new song", |app| app.library.tracks.len() == 5);
+    harness.run_steps(4);
+    let after = titles(&harness);
+    assert_eq!(after[..4], before[..], "the order so far stays");
+    assert_eq!(after[4], "e new");
+    assert_eq!(current_title(&harness), "c long");
+    assert!(!is_paused(&harness));
 }
 
 #[test]
@@ -516,6 +633,11 @@ fn render_screens() {
         harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(40)).unwrap();
         harness.state_mut().apply(Action::Expand);
         settle(&mut harness, "now-playing-lyrics");
+        harness.state_mut().apply(Action::ToggleShuffle);
+        harness.state_mut().apply(Action::ShowCardTab(CardTab::Queue));
+        settle(&mut harness, "now-playing-queue");
+        harness.state_mut().apply(Action::ToggleShuffle);
+        harness.state_mut().apply(Action::ShowCardTab(CardTab::Lyrics));
     }
     // The longest lyric line in the library shows the worst case for wrapping.
     let longest = harness

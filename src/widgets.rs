@@ -194,6 +194,78 @@ pub fn paint_edge_fades(ui: &Ui, rect: Rect, fade: f32, color: Color32) {
     ui.painter().add(mesh);
 }
 
+const MARQUEE_PAUSE: f64 = 2.5;
+const MARQUEE_SPEED: f64 = 28.0;
+const MARQUEE_GAP: f32 = 48.0;
+const MARQUEE_FADE: f32 = 14.0;
+
+/// How far a marquee has moved. It rests, then moves one full `cycle`, where the second copy
+/// of the text lands exactly on the first, and rests again.
+fn marquee_offset(elapsed: f64, cycle: f32) -> f32 {
+    let moving = f64::from(cycle) / MARQUEE_SPEED;
+    let phase = elapsed.max(0.0) % (MARQUEE_PAUSE + moving);
+    ((phase - MARQUEE_PAUSE).max(0.0) * MARQUEE_SPEED) as f32
+}
+
+/// Fades one end of `rect` into the background, where moving text gets cut off.
+fn paint_side_fade(ui: &Ui, painter: &egui::Painter, rect: Rect, at_left: bool) {
+    let color = ui.visuals().panel_fill;
+    let clear = color.gamma_multiply(0.0);
+    let (first, second, first_color, second_color) = if at_left {
+        (rect.left(), rect.left() + MARQUEE_FADE, color, clear)
+    } else {
+        (rect.right() - MARQUEE_FADE, rect.right(), clear, color)
+    };
+    let mut mesh = epaint::Mesh::default();
+    mesh.colored_vertex(egui::pos2(first, rect.top()), first_color);
+    mesh.colored_vertex(egui::pos2(second, rect.top()), second_color);
+    mesh.colored_vertex(egui::pos2(second, rect.bottom()), second_color);
+    mesh.colored_vertex(egui::pos2(first, rect.bottom()), first_color);
+    mesh.add_triangle(0, 1, 2);
+    mesh.add_triangle(0, 2, 3);
+    painter.add(mesh);
+}
+
+/// One line of text at its full length. Text that does not fit in `width` scrolls slowly
+/// instead of being cut short. Returns the height of the line.
+pub fn marquee(ui: &Ui, top_left: Pos2, width: f32, text: &str, font: FontId, color: Color32, elapsed: f64) -> f32 {
+    let galley = line(ui, text, font, color, f32::INFINITY);
+    let size = galley.size();
+    if size.x <= width {
+        ui.painter().galley(top_left, galley, Color32::PLACEHOLDER);
+        return size.y;
+    }
+
+    let rect = Rect::from_min_size(top_left, vec2(width, size.y));
+    let painter = ui.painter().with_clip_rect(ui.clip_rect().intersect(rect));
+    let cycle = size.x + MARQUEE_GAP;
+    let offset = marquee_offset(elapsed, cycle);
+    painter.galley(top_left - vec2(offset, 0.0), galley.clone(), Color32::PLACEHOLDER);
+    painter.galley(top_left + vec2(cycle - offset, 0.0), galley, Color32::PLACEHOLDER);
+    if offset > 0.0 {
+        paint_side_fade(ui, &painter, rect, true);
+    }
+    paint_side_fade(ui, &painter, rect, false);
+    ui.ctx().request_repaint_after_secs(1.0 / 30.0);
+    size.y
+}
+
 pub fn at(origin: Pos2, x: f32, y: f32, width: f32, height: f32) -> Rect {
     Rect::from_min_size(origin + vec2(x, y), vec2(width, height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn marquee_rests_then_moves_one_cycle_and_rests_again() {
+        let cycle = 280.0;
+        let moving = f64::from(cycle) / MARQUEE_SPEED;
+        assert_eq!(marquee_offset(0.0, cycle), 0.0);
+        assert_eq!(marquee_offset(MARQUEE_PAUSE, cycle), 0.0);
+        assert!((marquee_offset(MARQUEE_PAUSE + 1.0, cycle) - 28.0).abs() < 0.01);
+        assert!(marquee_offset(MARQUEE_PAUSE + moving - 0.001, cycle) <= cycle);
+        assert_eq!(marquee_offset(MARQUEE_PAUSE + moving, cycle), 0.0, "the next round starts at rest");
+    }
 }
