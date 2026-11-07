@@ -119,6 +119,13 @@ fn pointer_button(harness: &mut Harness<'static, App>, pos: egui::Pos2, pressed:
 }
 
 #[test]
+fn the_embedded_window_icon_is_valid() {
+    let icon = crate::app_icon();
+    assert_eq!((icon.width, icon.height), (256, 256));
+    assert_eq!(icon.rgba.len(), 256 * 256 * 4);
+}
+
+#[test]
 fn starts_on_the_list_without_autoplay() {
     let folder = TestFolder::new("start");
     let harness = harness_for(&folder);

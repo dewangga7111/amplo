@@ -26,54 +26,79 @@ impl eframe::App for App {
     }
 }
 
-/// The logo from the title bar: dark bars on a rounded accent square.
+/// The icon of the window itself. `build.rs` embeds the same logo in the executable.
 fn app_icon() -> egui::IconData {
-    const SIZE: usize = 64;
-    const RADIUS: f32 = 18.0;
-    // Center and half height of each bar, in the design's 24 unit icon grid.
-    const BARS: [(f32, f32); 5] = [(5.0, 2.0), (9.0, 6.0), (13.0, 3.0), (17.0, 8.0), (21.0, 2.0)];
+    let image = image::load_from_memory(include_bytes!("../assets/icons/amplo.png"))
+        .expect("the embedded icon is a valid PNG")
+        .into_rgba8();
+    let (width, height) = image.dimensions();
+    egui::IconData { rgba: image.into_raw(), width, height }
+}
 
-    let scale = SIZE as f32 / 24.0;
-    let mut rgba = Vec::with_capacity(SIZE * SIZE * 4);
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            let corner_x = (RADIUS - px).max(px - (SIZE as f32 - RADIUS)).max(0.0);
-            let corner_y = (RADIUS - py).max(py - (SIZE as f32 - RADIUS)).max(0.0);
-            let alpha = ((RADIUS - corner_x.hypot(corner_y) + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-            let on_bar = BARS.iter().any(|&(center, half)| {
-                (px / scale - center).abs() <= 1.4 && (py / scale - 12.0).abs() <= half + 1.4
-            });
-            let color = if on_bar { theme::ON_ACCENT } else { theme::ACCENT };
-            rgba.extend_from_slice(&[color.r(), color.g(), color.b(), alpha]);
-        }
+#[cfg(windows)]
+fn native_window(cc: &eframe::CreationContext<'_>) -> Option<windows::Win32::Foundation::HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+    match cc.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(window) => Some(windows::Win32::Foundation::HWND(window.hwnd.get() as *mut _)),
+        _ => None,
     }
-    egui::IconData { rgba, width: SIZE as u32, height: SIZE as u32 }
 }
 
 /// A window without a frame has square corners unless it asks Windows for round ones.
 #[cfg(windows)]
-fn round_corners(cc: &eframe::CreationContext<'_>) {
-    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-    use windows::Win32::{
-        Foundation::HWND,
-        Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
-    };
+fn round_corners(window: windows::Win32::Foundation::HWND) {
+    use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
 
-    let Ok(handle) = cc.window_handle() else { return };
-    let RawWindowHandle::Win32(window) = handle.as_raw() else { return };
     let preference = DWMWCP_ROUND;
-    // SAFETY: The handle belongs to the live window of `cc`, and the pointer and size describe
+    // SAFETY: The handle belongs to a live window, and the pointer and size describe
     // `preference`, which outlives the call. Older Windows versions return an error, and the
     // window then stays square.
     let _ = unsafe {
         DwmSetWindowAttribute(
-            HWND(window.hwnd.get() as *mut _),
+            window,
             DWMWA_WINDOW_CORNER_PREFERENCE,
             (&raw const preference).cast(),
             size_of_val(&preference) as u32,
         )
     };
+}
+
+/// The taskbar shows a window's big icon, and the window builder only sets the small one.
+#[cfg(windows)]
+fn set_taskbar_icon(window: windows::Win32::Foundation::HWND) {
+    use windows::{
+        Win32::{
+            Foundation::{LPARAM, WPARAM},
+            System::LibraryLoader::GetModuleHandleW,
+            UI::WindowsAndMessaging::{
+                GetSystemMetrics, ICON_BIG, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, SM_CXICON, SM_CYICON,
+                SendMessageW, WM_SETICON,
+            },
+        },
+        core::PCWSTR,
+    };
+
+    /// The resource number of the icon in `build.rs`.
+    const ICON_RESOURCE: usize = 1;
+
+    // SAFETY: The handles come from the calls before them, and the resource number stands in
+    // for a name, as `LoadImageW` documents. A build without the icon returns an error, and the
+    // window then keeps its default. The icon stays loaded for the life of the process.
+    unsafe {
+        let Ok(module) = GetModuleHandleW(None) else { return };
+        let (width, height) = (GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        let name = PCWSTR(ICON_RESOURCE as *const u16);
+        let Ok(icon) = LoadImageW(Some(module.into()), name, IMAGE_ICON, width, height, LR_DEFAULTCOLOR) else {
+            return;
+        };
+        SendMessageW(
+            window,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(icon.0 as isize)),
+        );
+    }
 }
 
 fn main() -> eframe::Result {
@@ -93,7 +118,10 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| {
             #[cfg(windows)]
-            round_corners(cc);
+            if let Some(window) = native_window(cc) {
+                round_corners(window);
+                set_taskbar_icon(window);
+            }
             let app = App::new(cc.egui_ctx.clone(), Settings::load(), Settings::default_path(), startup_paths);
             Ok(Box::new(app))
         }),

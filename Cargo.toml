@@ -1,6 +1,6 @@
 [package]
 name = "amplo"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 default-run = "amplo"
 
@@ -18,7 +18,7 @@ rustfft = "6.4.1"
 walkdir = "2.5.0"
 
 [target.'cfg(windows)'.dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Media_MediaFoundation", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [profile.release]
 strip = true
