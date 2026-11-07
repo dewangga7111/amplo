@@ -1,0 +1,29 @@
+[package]
+name = "amplo"
+version = "0.1.0"
+edition = "2024"
+default-run = "amplo"
+
+[dependencies]
+eframe = "0.37.0"
+egui_extras = { version = "0.37.0", default-features = false, features = ["svg"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
+lofty = "0.25.5"
+notify = "8.2.1"
+opus-pure = "0.2.2"
+raw-window-handle = "0.6.2"
+rfd = "0.17.2"
+rodio = { version = "0.23.0", default-features = false, features = ["playback", "flac", "mp3", "mp4", "vorbis", "wav"] }
+rustfft = "6.4.1"
+walkdir = "2.5.0"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Media_MediaFoundation", "Win32_System_Com"] }
+
+[profile.release]
+strip = true
+lto = "thin"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37.0", features = ["eframe", "wgpu"] }
+egui_system_font_provider = "0.37.0"
