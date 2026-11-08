@@ -16,6 +16,8 @@ use lofty::{
 };
 
 const MAX_SIZE: u32 = 300;
+/// The cover of the playing track in the full layout. Larger art is scaled down to this.
+const LARGE_MAX_SIZE: u32 = 1200;
 const PLACEHOLDER_SIZE: usize = 128;
 /// More textures than this means many playlists were opened, so old ones are dropped.
 const CACHE_LIMIT: usize = 64;
@@ -31,8 +33,14 @@ const PALETTE: [(u32, u32); 8] = [
     (0x2A0F14, 0xFF4D5E),
 ];
 
+struct Request {
+    path: PathBuf,
+    large: bool,
+}
+
 struct Loaded {
     path: PathBuf,
+    large: bool,
     image: Option<ColorImage>,
 }
 
@@ -42,16 +50,26 @@ enum Slot {
     Ready(TextureHandle),
 }
 
+/// The large cover of one track, for the full layout.
+pub enum LargeCover {
+    Loading,
+    Missing,
+    /// The texture and its size in pixels.
+    Ready(TextureId, egui::Vec2),
+}
+
 pub struct Covers {
-    requests: Sender<PathBuf>,
+    requests: Sender<Request>,
     results: Receiver<Loaded>,
     /// By path, so covers stay loaded when a rescan gives tracks new positions.
     slots: HashMap<PathBuf, Slot>,
+    /// Only one at a time, because only the playing track shows its cover this large.
+    large: Option<(PathBuf, Slot)>,
     placeholders: [Option<TextureHandle>; PALETTE.len()],
 }
 
 /// Newest request first, so the playing track does not wait behind a list of playlists.
-fn run_worker(requests: &Receiver<PathBuf>, results: &Sender<Loaded>, ctx: &egui::Context) {
+fn run_worker(requests: &Receiver<Request>, results: &Sender<Loaded>, ctx: &egui::Context) {
     let mut pending = Vec::new();
     loop {
         if pending.is_empty() {
@@ -61,16 +79,18 @@ fn run_worker(requests: &Receiver<PathBuf>, results: &Sender<Loaded>, ctx: &egui
             }
         }
         pending.extend(requests.try_iter());
-        let Some(path) = pending.pop() else { continue };
-        let image = read_cover(&path);
-        if results.send(Loaded { path, image }).is_err() {
+        let Some(Request { path, large }) = pending.pop() else { continue };
+        let max_size = if large { LARGE_MAX_SIZE } else { MAX_SIZE };
+        let image = cover_bytes(&path).and_then(|bytes| decode_cover(&bytes, max_size));
+        if results.send(Loaded { path, large, image }).is_err() {
             return;
         }
         ctx.request_repaint();
     }
 }
 
-fn read_cover(path: &Path) -> Option<ColorImage> {
+/// The encoded front cover from the file's tags, or else the first picture they have.
+pub fn cover_bytes(path: &Path) -> Option<Vec<u8>> {
     let tagged = Probe::open(path).ok()?.guess_file_type().ok()?.read().ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     let picture = tag
@@ -78,13 +98,13 @@ fn read_cover(path: &Path) -> Option<ColorImage> {
         .iter()
         .find(|picture| picture.pic_type() == PictureType::CoverFront)
         .or_else(|| tag.pictures().first())?;
-    decode_cover(picture.data())
+    Some(picture.data().to_vec())
 }
 
-/// Decodes to a square, cropped at the center, no bigger than the app ever shows it.
-fn decode_cover(bytes: &[u8]) -> Option<ColorImage> {
+/// Decodes to a square, cropped at the center, no bigger than `max_size` pixels.
+fn decode_cover(bytes: &[u8], max_size: u32) -> Option<ColorImage> {
     let image = image::load_from_memory(bytes).ok()?;
-    let size = image.width().min(image.height()).min(MAX_SIZE).max(1);
+    let size = image.width().min(image.height()).min(max_size).max(1);
     let square = image.resize_to_fill(size, size, FilterType::Triangle).into_rgba8();
     Some(ColorImage::from_rgba_unmultiplied([size as usize, size as usize], square.as_raw()))
 }
@@ -145,20 +165,43 @@ impl Covers {
             requests,
             results,
             slots: HashMap::new(),
+            large: None,
             placeholders: Default::default(),
         }
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
         for loaded in self.results.try_iter() {
+            let kind = if loaded.large { "large-cover" } else { "cover" };
             let slot = match loaded.image {
                 Some(image) => {
-                    let name = format!("cover-{}", loaded.path.display());
+                    let name = format!("{kind}-{}", loaded.path.display());
                     Slot::Ready(ctx.load_texture(name, image, TextureOptions::LINEAR))
                 }
                 None => Slot::Missing,
             };
-            self.slots.insert(loaded.path, slot);
+            if !loaded.large {
+                self.slots.insert(loaded.path, slot);
+            } else if let Some((path, large)) = &mut self.large
+                && *path == loaded.path
+            {
+                *large = slot;
+            }
+        }
+    }
+
+    /// The cover of a track at its own resolution, up to a limit. Showing it no larger
+    /// than that keeps it sharp.
+    pub fn large(&mut self, path: &Path) -> LargeCover {
+        if self.large.as_ref().is_none_or(|(large, _)| large != path) {
+            // The worker only stops when this struct is gone.
+            let _ = self.requests.send(Request { path: path.to_owned(), large: true });
+            self.large = Some((path.to_owned(), Slot::Loading));
+        }
+        match self.large.as_ref().map(|(_, slot)| slot) {
+            Some(Slot::Ready(texture)) => LargeCover::Ready(texture.id(), texture.size_vec2()),
+            Some(Slot::Missing) => LargeCover::Missing,
+            _ => LargeCover::Loading,
         }
     }
 
@@ -170,7 +213,7 @@ impl Covers {
                 self.slots.retain(|_, slot| matches!(slot, Slot::Loading));
             }
             // The worker only stops when this struct is gone.
-            let _ = self.requests.send(path.to_owned());
+            let _ = self.requests.send(Request { path: path.to_owned(), large: false });
             self.slots.insert(path.to_owned(), Slot::Loading);
         }
         if let Some(Slot::Ready(texture)) = self.slots.get(path) {
@@ -202,15 +245,16 @@ mod tests {
 
     #[test]
     fn crops_covers_to_squares_and_limits_their_size() {
-        assert_eq!(decode_cover(&png(900, 600)).unwrap().size, [300, 300]);
-        let small = decode_cover(&png(80, 120)).unwrap();
+        assert_eq!(decode_cover(&png(900, 600), MAX_SIZE).unwrap().size, [300, 300]);
+        assert_eq!(decode_cover(&png(900, 600), LARGE_MAX_SIZE).unwrap().size, [600, 600]);
+        let small = decode_cover(&png(80, 120), MAX_SIZE).unwrap();
         assert_eq!(small.size, [80, 80]);
         assert_eq!(small.pixels[0], Color32::from_rgb(200, 10, 20));
     }
 
     #[test]
     fn broken_picture_data_gives_no_cover() {
-        assert!(decode_cover(b"not an image").is_none());
+        assert!(decode_cover(b"not an image", MAX_SIZE).is_none());
     }
 
     #[test]

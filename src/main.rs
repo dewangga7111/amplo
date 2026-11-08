@@ -3,10 +3,15 @@
 
 mod app;
 mod covers;
+#[cfg(windows)]
+mod media_controls;
 #[cfg(test)]
 mod tests;
 mod theme;
+#[cfg(windows)]
+mod tray;
 mod ui;
+mod ui_full;
 mod widgets;
 
 use std::path::PathBuf;
@@ -101,8 +106,57 @@ fn set_taskbar_icon(window: windows::Win32::Foundation::HWND) {
     }
 }
 
+/// Windows maximizes a window without a title bar over the whole monitor, as if it were a
+/// fullscreen game, which hides the taskbar. This limits it to the work area instead.
+#[cfg(windows)]
+fn keep_taskbar_visible(window: windows::Win32::Foundation::HWND) {
+    use windows::Win32::{
+        Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
+        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow},
+        UI::{
+            Shell::{DefSubclassProc, SetWindowSubclass},
+            WindowsAndMessaging::{MINMAXINFO, WM_GETMINMAXINFO},
+        },
+    };
+
+    unsafe extern "system" fn limit_maximized(
+        window: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+        _id: usize,
+        _data: usize,
+    ) -> LRESULT {
+        // SAFETY: Forwards the message as it came, to the next handler of this window.
+        let result = unsafe { DefSubclassProc(window, message, wparam, lparam) };
+        if message == WM_GETMINMAXINFO && lparam.0 != 0 {
+            let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+            // SAFETY: `info` is a valid MONITORINFO whose size field is set, as the call needs.
+            let found = unsafe { GetMonitorInfoW(MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST), &mut info) };
+            if found.as_bool() {
+                // SAFETY: For WM_GETMINMAXINFO, Windows passes a valid MINMAXINFO in `lparam`.
+                let limits = unsafe { &mut *(lparam.0 as *mut MINMAXINFO) };
+                let (work, monitor) = (info.rcWork, info.rcMonitor);
+                limits.ptMaxPosition = POINT { x: work.left - monitor.left, y: work.top - monitor.top };
+                limits.ptMaxSize = POINT { x: work.right - work.left, y: work.bottom - work.top };
+            }
+        }
+        result
+    }
+
+    // SAFETY: The window belongs to this thread, as subclassing requires, and the procedure
+    // stays valid for the life of the process.
+    let _ = unsafe { SetWindowSubclass(window, Some(limit_maximized), 1, 0) };
+}
+
 fn main() -> eframe::Result {
     let startup_paths: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
+    // Starting the app again brings back the one that runs, often hidden in the notification
+    // area. Opening files with it still starts a new one, which plays them.
+    #[cfg(windows)]
+    if startup_paths.is_empty() && tray::show_running_instance() {
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
@@ -117,12 +171,16 @@ fn main() -> eframe::Result {
         APP_NAME,
         options,
         Box::new(|cc| {
+            #[cfg_attr(not(windows), expect(unused_mut))]
+            let mut app = App::new(cc.egui_ctx.clone(), Settings::load(), Settings::default_path(), startup_paths);
             #[cfg(windows)]
             if let Some(window) = native_window(cc) {
                 round_corners(window);
                 set_taskbar_icon(window);
+                keep_taskbar_visible(window);
+                app.attach_media_controls(window);
+                app.attach_tray(window);
             }
-            let app = App::new(cc.egui_ctx.clone(), Settings::load(), Settings::default_path(), startup_paths);
             Ok(Box::new(app))
         }),
     )

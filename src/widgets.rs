@@ -207,9 +207,8 @@ fn marquee_offset(elapsed: f64, cycle: f32) -> f32 {
     ((phase - MARQUEE_PAUSE).max(0.0) * MARQUEE_SPEED) as f32
 }
 
-/// Fades one end of `rect` into the background, where moving text gets cut off.
-fn paint_side_fade(ui: &Ui, painter: &egui::Painter, rect: Rect, at_left: bool) {
-    let color = ui.visuals().panel_fill;
+/// Fades one end of `rect` into `color`, where moving text gets cut off.
+fn paint_side_fade(painter: &egui::Painter, rect: Rect, at_left: bool, color: Color32) {
     let clear = color.gamma_multiply(0.0);
     let (first, second, first_color, second_color) = if at_left {
         (rect.left(), rect.left() + MARQUEE_FADE, color, clear)
@@ -226,9 +225,18 @@ fn paint_side_fade(ui: &Ui, painter: &egui::Painter, rect: Rect, at_left: bool) 
     painter.add(mesh);
 }
 
+pub struct MarqueeText<'a> {
+    pub text: &'a str,
+    pub font: FontId,
+    pub color: Color32,
+    /// What the text is painted on. The ends of moving text fade into it.
+    pub background: Color32,
+}
+
 /// One line of text at its full length. Text that does not fit in `width` scrolls slowly
 /// instead of being cut short. Returns the height of the line.
-pub fn marquee(ui: &Ui, top_left: Pos2, width: f32, text: &str, font: FontId, color: Color32, elapsed: f64) -> f32 {
+pub fn marquee(ui: &Ui, top_left: Pos2, width: f32, text: MarqueeText<'_>, elapsed: f64) -> f32 {
+    let MarqueeText { text, font, color, background } = text;
     let galley = line(ui, text, font, color, f32::INFINITY);
     let size = galley.size();
     if size.x <= width {
@@ -243,11 +251,44 @@ pub fn marquee(ui: &Ui, top_left: Pos2, width: f32, text: &str, font: FontId, co
     painter.galley(top_left - vec2(offset, 0.0), galley.clone(), Color32::PLACEHOLDER);
     painter.galley(top_left + vec2(cycle - offset, 0.0), galley, Color32::PLACEHOLDER);
     if offset > 0.0 {
-        paint_side_fade(ui, &painter, rect, true);
+        paint_side_fade(&painter, rect, true, background);
     }
-    paint_side_fade(ui, &painter, rect, false);
+    paint_side_fade(&painter, rect, false, background);
     ui.ctx().request_repaint_after_secs(1.0 / 30.0);
     size.y
+}
+
+/// A rounded button with an icon and a word, such as Play beside a playlist's title.
+/// `filled` gives it the accent color, and otherwise it has an outline.
+pub fn pill_button(
+    ui: &Ui,
+    rect: Rect,
+    icon: ImageSource<'static>,
+    icon_size: f32,
+    text: Arc<Galley>,
+    filled: bool,
+    label: &str,
+) -> Response {
+    let response = click_area(ui, rect, label);
+    let radius = rect.height() / 2.0;
+    let (fill, content) = match (filled, response.hovered()) {
+        (true, false) => (theme::ACCENT, theme::ON_ACCENT),
+        (true, true) => (theme::ACCENT_HOVER, theme::ON_ACCENT),
+        (false, false) => (Color32::TRANSPARENT, theme::TEXT),
+        (false, true) => (theme::ICON_HOVER, theme::TEXT),
+    };
+    let stroke = if filled { Stroke::NONE } else { Stroke::new(1.0, theme::PILL_LINE) };
+    ui.painter().rect(rect, radius, fill, stroke, StrokeKind::Inside);
+
+    let gap = 8.0;
+    let width = icon_size + gap + text.size().x;
+    let left = rect.center().x - width / 2.0;
+    let icon_rect = Rect::from_center_size(egui::pos2(left + icon_size / 2.0, rect.center().y), Vec2::splat(icon_size));
+    paint_icon(ui, icon_rect, icon, content);
+    let text_pos = egui::pos2(left + icon_size + gap, rect.center().y - text.size().y / 2.0);
+    ui.painter().galley(text_pos, text, content);
+    paint_focus(ui, &response, radius);
+    response
 }
 
 pub fn at(origin: Pos2, x: f32, y: f32, width: f32, height: f32) -> Rect {

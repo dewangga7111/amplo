@@ -1,4 +1,5 @@
-//! Draws the compact layout: 780 by 460 points, positioned like the design.
+//! Draws the compact layout: 780 by 460 points, positioned like the design. The parts that
+//! both layouts share are here too. The full layout is in `ui_full.rs`.
 
 use eframe::egui::{
     self, Align2, Color32, CornerRadius, Pos2, Rect, ScrollArea, Sense, Stroke, TextFormat, Ui, UiBuilder,
@@ -10,9 +11,10 @@ use amplo::library::{ALL_SONGS, LIKED_SONGS, Playlist};
 use crate::{
     app::{APP_NAME, Action, App, CardTab, VISUALIZER_BARS, format_time},
     theme,
+    ui_full,
     widgets::{
-        IconButton, accent_button, at, click_area, line, marquee, paint_edge_fades, paint_equalizer, paint_icon,
-        paint_shadow, paint_text, paint_texture, paint_two_lines, slider, spaced_line,
+        IconButton, MarqueeText, accent_button, at, click_area, line, marquee, paint_edge_fades, paint_equalizer,
+        paint_icon, paint_shadow, paint_text, paint_texture, paint_two_lines, slider, spaced_line,
     },
 };
 
@@ -26,27 +28,73 @@ const LIST_BOTTOM_SPACE: f32 = 80.0;
 const NAV_STEP: f32 = 46.0;
 const QUEUE_HEADING: f32 = 24.0;
 const QUEUE_ROW: f32 = 46.0;
-const LYRIC_HEIGHT: f32 = 46.0;
-/// One size for all lines. Only the color changes, so text never resizes or rewraps.
-const LYRIC_FONT_SIZE: f32 = 17.0;
-const LYRIC_ROW_HEIGHT: f32 = 21.25;
 /// Roughly how long, in seconds, the lyrics take to scroll most of the way to a new line.
 const LYRIC_GLIDE_TIME: f32 = 0.3;
-const UNKNOWN_TIME: &str = "-:--";
+pub const UNKNOWN_TIME: &str = "-:--";
+
+/// Sizes of the lyrics in one layout. One font size serves all lines, and only the color
+/// changes, so text never resizes or rewraps.
+pub struct LyricStyle {
+    pub font_size: f32,
+    pub line_height: f32,
+    /// The height of a line in the list. Long lines get all the rows they need.
+    pub min_slot: f32,
+    pub plain_font_size: f32,
+    pub empty_icon: f32,
+    pub empty_title: f32,
+    pub empty_text: f32,
+}
+
+const COMPACT_LYRICS: LyricStyle = LyricStyle {
+    font_size: 17.0,
+    line_height: 21.25,
+    min_slot: 46.0,
+    plain_font_size: 15.0,
+    empty_icon: 28.0,
+    empty_title: 16.0,
+    empty_text: 12.0,
+};
+
+/// Removes Space from this frame's input and tells whether it was pressed. Removed, so a
+/// focused button does not also react to it. Holding the key down does not repeat.
+fn take_space_press(ui: &Ui) -> bool {
+    ui.input_mut(|input| {
+        let mut pressed = false;
+        input.events.retain(|event| match event {
+            egui::Event::Key { key: egui::Key::Space, pressed: down, repeat, modifiers, .. } if modifiers.is_none() => {
+                pressed |= *down && !*repeat;
+                false
+            }
+            _ => true,
+        });
+        pressed
+    })
+}
+/// Lets the empty part of a title bar move the window, and a double click maximize it.
+pub fn title_bar_drag(ui: &Ui, rect: Rect, actions: &mut Vec<Action>) {
+    let drag = ui.interact(rect, ui.scope_id().with("title-bar"), Sense::click_and_drag());
+    if drag.drag_started() {
+        ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
+    }
+    if drag.double_clicked() {
+        actions.push(Action::ToggleFull);
+    }
+}
+
 /// Repaint rates while audio plays. Moving bars need more than the slow equalizers.
 const VISUALIZER_FRAME: f32 = 1.0 / 30.0;
 const LIST_FRAME: f32 = 1.0 / 15.0;
 
 /// Moves `value` toward `target` with a fast start and slow end, close to the design's
 /// `cubic-bezier(.2,.8,.2,1)`.
-fn ease(value: &mut f32, target: f32, rate: f32, dt: f32) {
+pub fn ease(value: &mut f32, target: f32, rate: f32, dt: f32) {
     *value += (target - *value) * (1.0 - (-rate * dt).exp());
     if (target - *value).abs() < 0.002 {
         *value = target;
     }
 }
 
-fn plural_songs(count: usize) -> String {
+pub fn plural_songs(count: usize) -> String {
     if count == 1 { "1 song".to_owned() } else { format!("{count} songs") }
 }
 
@@ -60,19 +108,35 @@ impl App {
         let mini_target = if has_track && target == 0.0 && self.slide < 0.8 { 1.0 } else { 0.0 };
         ease(&mut self.mini, mini_target, 12.0, dt);
 
-        let window = ui.max_rect();
-        ui.painter().rect_filled(window, 0.0, theme::BACKGROUND);
-        let mut actions = Vec::new();
-        let title = Rect::from_min_size(window.min, vec2(window.width(), TITLE_HEIGHT));
-        let sidebar = Rect::from_min_max(
-            pos2(window.left(), title.bottom()),
-            pos2(window.left() + SIDEBAR_WIDTH, window.bottom()),
-        );
-        let stage = Rect::from_min_max(pos2(sidebar.right(), title.bottom()), window.max);
+        // Windows reports the state, so maximizing by any means shows the full layout.
+        if let Some(maximized) = ui.input(|input| input.viewport().maximized) {
+            self.full = maximized;
+        }
 
-        self.draw_title_bar(ui, title);
-        self.draw_sidebar(ui, sidebar, &mut actions);
-        self.draw_stage(ui, stage, dt, &mut actions);
+        let window = ui.max_rect();
+        let background = if self.full { theme::FULL_BACKGROUND } else { theme::BACKGROUND };
+        ui.painter().rect_filled(window, 0.0, background);
+        let mut actions = Vec::new();
+        // Space types into the search box while it has the focus.
+        if !ui.ctx().egui_wants_keyboard_input() && take_space_press(ui) {
+            actions.push(Action::Toggle);
+        }
+        if self.full {
+            let (sidebar, title, stage) = ui_full::split(window);
+            self.draw_full_title_bar(ui, title, &mut actions);
+            self.draw_full_sidebar(ui, sidebar, &mut actions);
+            self.draw_stage(ui, stage, dt, &mut actions);
+        } else {
+            let title = Rect::from_min_size(window.min, vec2(window.width(), TITLE_HEIGHT));
+            let sidebar = Rect::from_min_max(
+                pos2(window.left(), title.bottom()),
+                pos2(window.left() + SIDEBAR_WIDTH, window.bottom()),
+            );
+            let stage = Rect::from_min_max(pos2(sidebar.right(), title.bottom()), window.max);
+            self.draw_title_bar(ui, title, &mut actions);
+            self.draw_sidebar(ui, sidebar, &mut actions);
+            self.draw_stage(ui, stage, dt, &mut actions);
+        }
 
         for action in actions {
             self.apply(action);
@@ -89,15 +153,11 @@ impl App {
         }
     }
 
-    fn draw_title_bar(&self, ui: &mut Ui, rect: Rect) {
+    fn draw_title_bar(&self, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         let painter = ui.painter();
         painter.rect_filled(rect, 0.0, theme::TITLE_BAR);
         painter.hline(rect.x_range(), rect.bottom() - 0.5, Stroke::new(1.0, theme::LINE));
-
-        let drag = ui.interact(rect, ui.scope_id().with("title-bar"), Sense::click_and_drag());
-        if drag.drag_started() {
-            ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
-        }
+        title_bar_drag(ui, rect, actions);
 
         let center_y = rect.center().y;
         let logo = Rect::from_center_size(pos2(rect.left() + 23.0, center_y), Vec2::splat(18.0));
@@ -108,7 +168,8 @@ impl App {
         let name_right = logo.right() + 10.0 + name.size().x;
         paint_text(ui, Align2::LEFT_CENTER, pos2(logo.right() + 10.0, center_y), name);
 
-        let minimize = Rect::from_center_size(pos2(rect.right() - 53.0, center_y), vec2(30.0, 26.0));
+        let minimize = Rect::from_center_size(pos2(rect.right() - 85.0, center_y), vec2(30.0, 26.0));
+        let maximize = Rect::from_center_size(pos2(rect.right() - 53.0, center_y), vec2(30.0, 26.0));
         let close = Rect::from_center_size(pos2(rect.right() - 21.0, center_y), vec2(30.0, 26.0));
 
         let status_left = name_right + 10.0;
@@ -135,18 +196,21 @@ impl App {
             hover.on_hover_text(status);
         }
 
-        let button = |icon, label: &str, target: Rect| {
-            IconButton { icon, icon_size: 14.0, color: theme::SOFT, radius: 6.0 }.show(ui, target, label)
+        let button = |icon, size, label: &str, target: Rect| {
+            IconButton { icon, icon_size: size, color: theme::SOFT, radius: 6.0 }.show(ui, target, label)
         };
-        if button(theme::MINIMIZE, "Minimize", minimize).clicked() {
+        if button(theme::MINIMIZE, 14.0, "Minimize", minimize).clicked() {
             ui.ctx().send_viewport_cmd(ViewportCommand::Minimized(true));
         }
-        if button(theme::CLOSE, "Close", close).clicked() {
-            ui.ctx().send_viewport_cmd(ViewportCommand::Close);
+        if button(theme::MAXIMIZE, 13.0, "Maximize", maximize).clicked() {
+            actions.push(Action::ToggleFull);
+        }
+        if button(theme::CLOSE, 14.0, "Close", close).clicked() {
+            actions.push(Action::HideToTray);
         }
     }
 
-    fn visible_playlists(&self) -> Vec<usize> {
+    pub fn visible_playlists(&self) -> Vec<usize> {
         (0..self.library.playlists.len())
             .filter(|&index| match index {
                 ALL_SONGS => !self.library.tracks.is_empty(),
@@ -239,7 +303,11 @@ impl App {
                         ui.disable();
                         ui.style_mut().visuals.disabled_alpha = 1.0;
                     }
-                    self.draw_list_section(ui, stage, actions);
+                    if self.full {
+                        self.draw_full_list(ui, stage, actions);
+                    } else {
+                        self.draw_list_section(ui, stage, actions);
+                    }
                 });
             }
 
@@ -249,23 +317,34 @@ impl App {
                 let builder = UiBuilder::new().id_salt("now-playing").max_rect(panel);
                 ui.scope_builder(builder, |ui| {
                     ui.multiply_opacity((self.slide / 0.6).min(1.0));
-                    self.draw_now_playing(ui, panel, dt, actions);
+                    if self.full {
+                        self.draw_full_now_playing(ui, panel, dt, actions);
+                    } else {
+                        self.draw_now_playing(ui, panel, dt, actions);
+                    }
                 });
             }
 
             if self.mini > 0.0 {
-                let offset = (1.0 - self.mini) * MINI_HEIGHT * 1.2;
+                let (height, margin) = if self.full { (ui_full::MINI_HEIGHT, 16.0) } else { (MINI_HEIGHT, 10.0) };
+                let offset = (1.0 - self.mini) * height * 1.2;
                 let rect = Rect::from_min_max(
-                    pos2(stage.left() + 10.0, stage.bottom() - 10.0 - MINI_HEIGHT + offset),
-                    pos2(stage.right() - 10.0, stage.bottom() - 10.0 + offset),
+                    pos2(stage.left() + margin, stage.bottom() - margin - height + offset),
+                    pos2(stage.right() - margin, stage.bottom() - margin + offset),
                 );
                 let builder = UiBuilder::new().id_salt("mini").max_rect(rect);
-                ui.scope_builder(builder, |ui| self.draw_mini(ui, rect, actions));
+                ui.scope_builder(builder, |ui| {
+                    if self.full {
+                        self.draw_full_mini(ui, rect, actions);
+                    } else {
+                        self.draw_mini(ui, rect, actions);
+                    }
+                });
             }
         });
     }
 
-    fn draw_empty_state(&self, ui: &mut Ui, stage: Rect, actions: &mut Vec<Action>) {
+    pub fn draw_empty_state(&self, ui: &mut Ui, stage: Rect, actions: &mut Vec<Action>) {
         let center = stage.center();
         let icon = Rect::from_center_size(center - vec2(0.0, 58.0), Vec2::splat(28.0));
         paint_icon(ui, icon, theme::NOTE, theme::SOFT);
@@ -458,30 +537,59 @@ impl App {
         let elapsed = ui.input(|input| input.time) - self.marquee_started;
         let info = &self.library.tracks[track].info;
         let title_top = cover.bottom() + 10.0;
-        let title_height =
-            marquee(ui, pos2(left, title_top), column, &info.title, theme::grotesk_bold(19.0), theme::TEXT, elapsed);
-        let artist = if info.artist.is_empty() { "Unknown artist" } else { &info.artist };
+        let text = |text, font, color| MarqueeText { text, font, color, background: theme::BACKGROUND };
+        let title = text(&info.title, theme::grotesk_bold(19.0), theme::TEXT);
+        let title_height = marquee(ui, pos2(left, title_top), column, title, elapsed);
+        let artist = text(artist_name(&info.artist), theme::inter(13.0), theme::SOFT);
         let artist_top = title_top + title_height + 2.0;
-        let artist_height = marquee(ui, pos2(left, artist_top), column, artist, theme::inter(13.0), theme::SOFT, elapsed);
+        let artist_height = marquee(ui, pos2(left, artist_top), column, artist, elapsed);
 
         let bars_top = artist_top + artist_height + 10.0;
-        self.draw_visualizer(ui, Rect::from_min_size(pos2(left, bars_top), vec2(column, 26.0)));
+        self.draw_visualizer(ui, Rect::from_min_size(pos2(left, bars_top), vec2(column, 26.0)), 2.0);
 
         let lyrics = Rect::from_min_max(pos2(left + column + 14.0, top), pos2(content.right(), cards_bottom));
         self.draw_card(ui, lyrics, dt, actions);
         self.draw_transport(ui, content, transport_top, track, actions);
     }
 
-    fn draw_visualizer(&self, ui: &Ui, rect: Rect) {
-        const GAP: f32 = 2.0;
+    pub fn draw_visualizer(&self, ui: &Ui, rect: Rect, gap: f32) {
         let count = VISUALIZER_BARS as f32;
-        let width = (rect.width() - GAP * (count - 1.0)) / count;
+        let width = (rect.width() - gap * (count - 1.0)) / count;
         let color = theme::ACCENT.gamma_multiply(0.85);
         for (index, &level) in self.analyzer.bars().iter().enumerate() {
             let height = 2.0 + level * (rect.height() - 2.0);
-            let x = rect.left() + index as f32 * (width + GAP);
+            let x = rect.left() + index as f32 * (width + gap);
             let bar = Rect::from_min_max(pos2(x, rect.bottom() - height), pos2(x + width, rect.bottom()));
             ui.painter().rect_filled(bar, 1.0, color);
+        }
+    }
+
+    /// The Lyrics and Queue tabs of the card beside the cover, starting at `left` and `top`.
+    pub fn draw_card_tabs(&self, ui: &Ui, left: f32, top: f32, font: egui::FontId, uppercase: bool, actions: &mut Vec<Action>) {
+        let mut tab_left = left;
+        for (tab, label) in [(CardTab::Lyrics, "Lyrics"), (CardTab::Queue, "Queue")] {
+            let title = if uppercase { label.to_uppercase() } else { label.to_owned() };
+            let spacing = if uppercase { 1.0 } else { 0.0 };
+            let galley = spaced_line(ui, &title, font.clone(), Color32::PLACEHOLDER, 200.0, spacing);
+            let text = Rect::from_min_size(pos2(tab_left, top), galley.size());
+            let response = click_area(ui, text.expand2(vec2(5.0, 7.0)), label);
+            let active = self.card_tab == tab;
+            let color = if active {
+                theme::TEXT
+            } else if response.hovered() {
+                theme::SOFT
+            } else {
+                theme::MUTED
+            };
+            ui.painter().galley(text.min, galley, color);
+            if active {
+                let line = Rect::from_x_y_ranges(text.x_range(), text.bottom() + 2.0..=text.bottom() + 4.0);
+                ui.painter().rect_filled(line, 1.0, theme::ACCENT);
+            }
+            if response.clicked() {
+                actions.push(Action::ShowCardTab(tab));
+            }
+            tab_left = text.right() + font.size * 1.4;
         }
     }
 
@@ -508,33 +616,17 @@ impl App {
     fn draw_card(&mut self, ui: &mut Ui, card: Rect, dt: f32, actions: &mut Vec<Action>) {
         ui.painter().rect(card, 12.0, theme::PANEL, Stroke::new(1.0, theme::LINE), egui::StrokeKind::Inside);
         let inner = card.shrink2(vec2(17.0, 15.0));
-
-        let mut tab_left = inner.left();
-        for (tab, title, label) in [(CardTab::Lyrics, "LYRICS", "Lyrics"), (CardTab::Queue, "QUEUE", "Queue")] {
-            let galley = spaced_line(ui, title, theme::inter_semibold(10.0), Color32::PLACEHOLDER, 100.0, 1.0);
-            let text = Rect::from_min_size(pos2(tab_left, inner.top()), galley.size());
-            let response = click_area(ui, text.expand2(vec2(5.0, 7.0)), label);
-            let active = self.card_tab == tab;
-            let color = if active {
-                theme::TEXT
-            } else if response.hovered() {
-                theme::SOFT
-            } else {
-                theme::MUTED
-            };
-            ui.painter().galley(text.min, galley, color);
-            if active {
-                let line = Rect::from_x_y_ranges(text.x_range(), text.bottom() + 2.0..=text.bottom() + 4.0);
-                ui.painter().rect_filled(line, 1.0, theme::ACCENT);
-            }
-            if response.clicked() {
-                actions.push(Action::ShowCardTab(tab));
-            }
-            tab_left = text.right() + 14.0;
-        }
+        self.draw_card_tabs(ui, inner.left(), inner.top(), theme::inter_semibold(10.0), true, actions);
 
         match self.card_tab {
-            CardTab::Lyrics => self.draw_lyrics(ui, inner, dt),
+            CardTab::Lyrics => {
+                if self.lyrics.as_ref().is_some_and(|lyrics| lyrics.synced) {
+                    let badge = spaced_line(ui, "SYNCED", theme::inter_semibold(10.0), theme::ACCENT, 100.0, 0.6);
+                    paint_text(ui, Align2::RIGHT_TOP, inner.right_top(), badge);
+                }
+                let view = Rect::from_min_max(pos2(inner.left(), inner.top() + 20.0), inner.max);
+                self.draw_lyrics(ui, view, dt, &COMPACT_LYRICS);
+            }
             CardTab::Queue => {
                 // The lyrics do not animate while hidden, so nothing is left to wait for.
                 self.lyric_motion.moving = false;
@@ -547,7 +639,7 @@ impl App {
         }
     }
 
-    fn draw_queue(&mut self, ui: &mut Ui, view: Rect, actions: &mut Vec<Action>) {
+    pub fn draw_queue(&mut self, ui: &mut Ui, view: Rect, actions: &mut Vec<Action>) {
         let Some(queue) = &self.queue else { return };
         let (position, count) = (queue.position, queue.tracks.len());
         let source = queue.playlist.and_then(|index| self.library.playlists.get(index));
@@ -617,51 +709,48 @@ impl App {
         paint_two_lines(ui, left, center_y, 1.0, title, artist);
     }
 
-    fn draw_lyrics(&mut self, ui: &mut Ui, inner: Rect, dt: f32) {
+    /// The lyrics, or a note that there are none, inside `view`.
+    pub fn draw_lyrics(&mut self, ui: &mut Ui, view: Rect, dt: f32, style: &LyricStyle) {
         let Some(lyrics) = &self.lyrics else {
-            let center = inner.center();
-            paint_icon(ui, Rect::from_center_size(center - vec2(0.0, 36.0), Vec2::splat(28.0)), theme::NOTE, theme::SOFT);
-            let title = line(ui, "Lyrics not available", theme::grotesk_semibold(16.0), theme::TEXT, inner.width());
+            let center = view.center() - vec2(0.0, 10.0);
+            let icon = Rect::from_center_size(center - vec2(0.0, style.empty_icon + 8.0), Vec2::splat(style.empty_icon));
+            paint_icon(ui, icon, theme::NOTE, theme::SOFT);
+            let title =
+                line(ui, "Lyrics not available", theme::grotesk_semibold(style.empty_title), theme::TEXT, view.width());
             paint_text(ui, Align2::CENTER_CENTER, center - vec2(0.0, 4.0), title);
             let mut job = LayoutJob::simple(
                 "Lyrics for this song haven’t been added yet.".to_owned(),
-                theme::inter(12.0),
+                theme::inter(style.empty_text),
                 theme::SOFT,
-                inner.width(),
+                view.width(),
             );
             job.halign = egui::Align::Center;
             let sub = ui.painter().layout_job(job);
             // Centered text is laid out around its position, so no anchor is needed.
-            ui.painter().galley(center + vec2(0.0, 12.0), sub, Color32::PLACEHOLDER);
+            ui.painter().galley(center + vec2(0.0, style.empty_title * 0.75), sub, Color32::PLACEHOLDER);
             return;
         };
-        let synced = lyrics.synced;
-        if synced {
-            let badge = spaced_line(ui, "SYNCED", theme::inter_semibold(10.0), theme::ACCENT, 100.0, 0.6);
-            paint_text(ui, Align2::RIGHT_TOP, inner.right_top(), badge);
-        }
-
-        let view = Rect::from_min_max(pos2(inner.left(), inner.top() + 20.0), inner.max);
-        if synced {
-            self.draw_synced_lines(ui, view, dt);
+        if lyrics.synced {
+            self.draw_synced_lines(ui, view, dt, style);
         } else {
-            self.draw_plain_lines(ui, view);
+            self.draw_plain_lines(ui, view, style);
         }
         paint_edge_fades(ui, view, view.height() * 0.14, theme::PANEL);
     }
 
-    fn draw_synced_lines(&mut self, ui: &mut Ui, view: Rect, dt: f32) {
+    fn draw_synced_lines(&mut self, ui: &mut Ui, view: Rect, dt: f32, style: &LyricStyle) {
         let Some(lyrics) = &self.lyrics else { return };
         // Laid out without a color, so a color fade does not lay the text out again.
         let galleys: Vec<_> = lyrics
             .lines
             .iter()
             .map(|line| {
-                let font = theme::grotesk_semibold(LYRIC_FONT_SIZE);
-                wrapped(ui, &line.text, font, Color32::PLACEHOLDER, view.width(), LYRIC_ROW_HEIGHT)
+                let font = theme::grotesk_semibold(style.font_size);
+                wrapped(ui, &line.text, font, Color32::PLACEHOLDER, view.width(), style.line_height)
             })
             .collect();
-        let slots: Vec<f32> = galleys.iter().map(|galley| lyric_slot_height(galley.size().y)).collect();
+        let slots: Vec<f32> =
+            galleys.iter().map(|galley| lyric_slot_height(galley.size().y, style.min_slot)).collect();
         self.update_lyric_motion(view.height(), &slots, dt);
 
         let motion = &self.lyric_motion;
@@ -692,14 +781,16 @@ impl App {
         }
     }
 
-    fn draw_plain_lines(&self, ui: &mut Ui, view: Rect) {
+    fn draw_plain_lines(&self, ui: &mut Ui, view: Rect, style: &LyricStyle) {
         let Some(lyrics) = &self.lyrics else { return };
+        let size = style.plain_font_size;
         ui.scope_builder(UiBuilder::new().id_salt("plain-lyrics").max_rect(view), |ui| {
             ui.set_clip_rect(ui.clip_rect().intersect(view));
             ScrollArea::vertical().id_salt("plain-lyrics-scroll").auto_shrink(false).show(ui, |ui| {
                 ui.add_space(view.height() * 0.14);
                 for text in &lyrics.lines {
-                    let galley = wrapped(ui, &text.text, theme::grotesk_semibold(15.0), theme::SOFT, view.width() - 8.0, 18.75);
+                    let font = theme::grotesk_semibold(size);
+                    let galley = wrapped(ui, &text.text, font, theme::SOFT, view.width() - 8.0, size * 1.25);
                     ui.add(egui::Label::new(galley));
                     ui.add_space(6.0);
                 }
@@ -714,25 +805,12 @@ impl App {
         ui.painter().hline(left..=right, top + 0.5, Stroke::new(1.0, theme::LINE));
 
         let seek_y = top + 19.0;
-        let total = self.duration.map_or(0.0, |duration| duration.as_secs_f32());
-        let time = if total > 0.0 { format_time(total) } else { UNKNOWN_TIME.to_owned() };
-        let time = line(ui, &time, theme::mono(11.0), theme::SOFT, f32::INFINITY);
+        let time = line(ui, &self.total_time(), theme::mono(11.0), theme::SOFT, f32::INFINITY);
         let time_left = right - time.size().x;
         paint_text(ui, Align2::RIGHT_CENTER, pos2(right, seek_y), time);
 
         let seek = Rect::from_min_max(pos2(left, seek_y - 8.0), pos2(time_left - 10.0, seek_y + 8.0));
-        let mut fraction = if total > 0.0 { self.position() / total } else { 0.0 };
-        let response = slider(ui, seek, "Position", &mut fraction);
-        if total > 0.0 {
-            if response.changed() {
-                self.seek_preview = Some(fraction * total);
-            }
-            if !response.is_pointer_button_down_on()
-                && let Some(target) = self.seek_preview.take()
-            {
-                actions.push(Action::Seek(target));
-            }
-        }
+        self.seek_slider(ui, seek, actions);
 
         let center_y = top + 55.0;
         let center_x = content.center().x;
@@ -776,8 +854,37 @@ impl App {
         let volume = Rect::from_min_max(pos2(right - 110.0, center_y - 8.0), pos2(right, center_y + 8.0));
         let icon = Rect::from_center_size(pos2(volume.left() - 16.0, center_y), Vec2::splat(16.0));
         paint_icon(ui, icon, theme::VOLUME, theme::SOFT);
+        self.volume_slider(ui, volume, actions);
+    }
+
+    /// The length of the playing track, as the end of the seek bar shows it.
+    pub fn total_time(&self) -> String {
+        match self.duration {
+            Some(duration) if !duration.is_zero() => format_time(duration.as_secs_f32()),
+            _ => UNKNOWN_TIME.to_owned(),
+        }
+    }
+
+    /// Moves through the track. The seek happens when the slider is let go.
+    pub fn seek_slider(&mut self, ui: &Ui, rect: Rect, actions: &mut Vec<Action>) {
+        let total = self.duration.map_or(0.0, |duration| duration.as_secs_f32());
+        let mut fraction = if total > 0.0 { self.position() / total } else { 0.0 };
+        let response = slider(ui, rect, "Position", &mut fraction);
+        if total > 0.0 {
+            if response.changed() {
+                self.seek_preview = Some(fraction * total);
+            }
+            if !response.is_pointer_button_down_on()
+                && let Some(target) = self.seek_preview.take()
+            {
+                actions.push(Action::Seek(target));
+            }
+        }
+    }
+
+    pub fn volume_slider(&mut self, ui: &Ui, rect: Rect, actions: &mut Vec<Action>) {
         let mut level = self.settings.volume;
-        let response = slider(ui, volume, "Volume", &mut level);
+        let response = slider(ui, rect, "Volume", &mut level);
         if response.changed() {
             self.set_volume(level);
         }
@@ -869,8 +976,13 @@ fn glide(value: &mut f32, velocity: &mut f32, target: f32, dt: f32) {
 }
 
 /// The height of a lyric line in the list. Long lines get all the rows they need.
-fn lyric_slot_height(text_height: f32) -> f32 {
-    (text_height + 4.0).max(LYRIC_HEIGHT)
+fn lyric_slot_height(text_height: f32, min_slot: f32) -> f32 {
+    (text_height + 4.0).max(min_slot)
+}
+
+/// The artist, or a note that the file does not say.
+pub fn artist_name(artist: &str) -> &str {
+    if artist.is_empty() { "Unknown artist" } else { artist }
 }
 
 /// Lays out text over as many rows as it needs, without shortening it.
@@ -905,7 +1017,7 @@ mod tests {
             let galley = wrapped(ui, text, font, Color32::WHITE, 233.0, 22.5);
             assert!(galley.rows.len() > 2, "expected more than 2 rows, got {}", galley.rows.len());
             assert!(!galley.elided);
-            assert!(lyric_slot_height(galley.size().y) > galley.size().y);
+            assert!(lyric_slot_height(galley.size().y, COMPACT_LYRICS.min_slot) > galley.size().y);
         });
         harness.step();
     }
@@ -941,6 +1053,6 @@ mod tests {
 
     #[test]
     fn short_lyric_lines_keep_the_design_height() {
-        assert_eq!(lyric_slot_height(22.5), LYRIC_HEIGHT);
+        assert_eq!(lyric_slot_height(22.5, COMPACT_LYRICS.min_slot), COMPACT_LYRICS.min_slot);
     }
 }

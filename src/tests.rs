@@ -10,7 +10,7 @@ use std::{
 
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::{Harness, kittest::Queryable};
-use amplo::{lyrics::Lyrics, settings::Settings};
+use amplo::{library::ALL_SONGS, lyrics::Lyrics, settings::Settings};
 
 use crate::{
     app::{Action, App, CardTab},
@@ -147,17 +147,18 @@ fn rows_play_in_the_list_and_the_mini_player_opens_now_playing() {
 
     click(&mut harness, "3. c long");
     assert_eq!(current_title(&harness), "c long");
-    assert!(harness.state().minimized, "a row click stays in the list");
+    assert!(!harness.state().minimized, "a row click opens Now Playing");
+    assert_eq!(harness.state().slide, 1.0);
     assert!(harness.state().player.is_some());
     assert_eq!(harness.state().error, None);
-    harness.get_by_label("Expand");
-
-    click(&mut harness, "Expand");
-    assert!(!harness.state().minimized);
-    assert_eq!(harness.state().slide, 1.0);
-    assert!(harness.query_by_label("Expand").is_none(), "the mini player leaves");
+    assert!(harness.query_by_label("Expand").is_none(), "no mini player over Now Playing");
     assert!(harness.query_by_label("3. c long").is_none(), "the list is covered");
     assert_eq!(harness.state().tech, ["706 KBPS", "44.1 KHZ", "MONO"]);
+
+    click(&mut harness, "Back to song list");
+    assert!(harness.state().minimized);
+    click(&mut harness, "Expand");
+    assert!(!harness.state().minimized, "the mini player opens Now Playing again");
 
     click(&mut harness, "Mix");
     assert!(harness.state().minimized);
@@ -171,7 +172,6 @@ fn transport_pauses_seeks_and_resumes() {
     let folder = TestFolder::new("transport");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
 
     click(&mut harness, "Pause");
     assert!(is_paused(&harness));
@@ -213,7 +213,6 @@ fn volume_slider_changes_the_player() {
     let folder = TestFolder::new("volume");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
 
     let center = harness.get_all_by_role(Role::Slider).nth(1).unwrap().rect().left_center();
     harness.input_mut().events.push(egui::Event::PointerMoved(center));
@@ -272,7 +271,6 @@ fn repeat_plays_the_same_track_again() {
     let folder = TestFolder::new("repeat");
     let mut harness = harness_for(&folder);
     click(&mut harness, "1. a short");
-    click(&mut harness, "Expand");
     click(&mut harness, "Repeat");
     assert!(harness.state().repeat);
     // The next finish restarts the track from the start.
@@ -292,7 +290,6 @@ fn like_saves_and_fills_the_liked_playlist() {
     let mut harness = harness_with(&folder, silent_settings(), Some(settings_path.clone()));
 
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     click(&mut harness, "Like");
     let saved = Settings::parse(&fs::read_to_string(&settings_path).unwrap());
     assert_eq!(saved.liked, BTreeSet::from([folder.0.join("c long.wav")]));
@@ -314,7 +311,6 @@ fn lyrics_follow_playback() {
     let folder = TestFolder::new("lyrics");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     assert!(harness.state().lyrics.as_ref().unwrap().synced);
     assert_eq!(harness.state().lyric_motion.active, Some(0));
 
@@ -362,7 +358,6 @@ fn now_playing_minimizes_back_to_the_song_list() {
     let folder = TestFolder::new("minimize");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     assert!(harness.query_by_label("3. c long").is_none());
 
     click(&mut harness, "Back to song list");
@@ -389,7 +384,7 @@ fn shuffle_play_builds_a_new_order_each_time() {
     }
     assert_eq!(starts, BTreeSet::from(["a short".to_owned(), "c long".to_owned()]));
     assert!(harness.state().shuffle, "shuffle stays on");
-    assert!(harness.state().minimized, "like a row click, it stays in the list");
+    assert!(harness.state().minimized, "the playlist's buttons stay in the list");
 }
 
 fn play_order(harness: &Harness<'static, App>) -> Vec<usize> {
@@ -405,7 +400,6 @@ fn next_and_previous_walk_the_shuffled_order() {
     let folder = TestFolder::new("shuffle-walk");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     click(&mut harness, "Shuffle");
 
     let order = play_order(&harness);
@@ -427,7 +421,6 @@ fn back_after_a_track_ends_finds_the_song_before_it() {
     let folder = TestFolder::new("shuffle-end");
     let mut harness = harness_for(&folder);
     click(&mut harness, "1. a short");
-    click(&mut harness, "Expand");
     click(&mut harness, "Shuffle");
     // a short, b short2, c long, in that order.
     harness.state_mut().queue.as_mut().unwrap().tracks = vec![0, 1, 2];
@@ -444,7 +437,6 @@ fn clicking_in_the_queue_keeps_the_order() {
     let folder = TestFolder::new("queue-click");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     click(&mut harness, "Shuffle");
     click(&mut harness, "Queue");
     let order = play_order(&harness);
@@ -468,7 +460,6 @@ fn clicking_a_song_outside_the_queue_reshuffles() {
     let folder = TestFolder::new("queue-outside");
     let mut harness = harness_for(&folder);
     click(&mut harness, "1. a short");
-    click(&mut harness, "Expand");
     click(&mut harness, "Shuffle");
     click(&mut harness, "Back to song list");
 
@@ -482,6 +473,7 @@ fn clicking_a_song_outside_the_queue_reshuffles() {
         sorted.sort_unstable();
         assert_eq!(sorted, [0, 1, 2, 3]);
         orders.insert(order);
+        click(&mut harness, "Back to song list");
     }
     assert!(orders.len() > 1, "the order never changed");
 }
@@ -491,7 +483,6 @@ fn turning_shuffle_off_restores_the_playlist_order() {
     let folder = TestFolder::new("shuffle-off");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     click(&mut harness, "Shuffle");
     click(&mut harness, "Shuffle");
     assert!(!harness.state().shuffle);
@@ -505,7 +496,6 @@ fn a_rescan_keeps_the_shuffled_order_and_adds_new_songs_after_it() {
     let folder = TestFolder::new("shuffle-rescan");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
     click(&mut harness, "Shuffle");
     let titles = |harness: &Harness<'static, App>| -> Vec<String> {
         let app = harness.state();
@@ -529,6 +519,7 @@ fn new_songs_and_playlists_appear_without_stopping_playback() {
     let folder = TestFolder::new("watch-add");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
+    click(&mut harness, "Back to song list");
     harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(5)).unwrap();
 
     // Sorts before the playing track, so the track numbers shift.
@@ -580,7 +571,6 @@ fn removing_the_playing_file_stops_it_with_a_message() {
     let folder = TestFolder::new("watch-playing");
     let mut harness = harness_for(&folder);
     click(&mut harness, "3. c long");
-    click(&mut harness, "Expand");
 
     fs::remove_file(folder.0.join("c long.wav")).unwrap();
     wait_until(&mut harness, "removal", |app| app.library.tracks.len() == 3);
@@ -629,6 +619,7 @@ fn render_screens() {
     };
     if let Some(row) = with_lyrics(harness.state(), true) {
         harness.state_mut().apply(Action::PlayRow(row));
+        harness.state_mut().apply(Action::Minimize);
         settle(&mut harness, "list-playing");
         harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(40)).unwrap();
         harness.state_mut().apply(Action::Expand);
@@ -664,25 +655,112 @@ fn render_screens() {
     let playlists = harness.state().library.playlists.len();
     harness.state_mut().apply(Action::OpenPlaylist(playlists - 1));
     settle(&mut harness, "playlist");
+
+    // The full layout at the design's size, and at a maximized 1920 by 1080 screen at 125 %.
+    for (size, suffix) in [(egui::vec2(1280.0, 780.0), ""), (egui::vec2(1536.0, 824.0), "-wide")] {
+        harness.set_size(size);
+        harness.state_mut().full = true;
+        harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
+        settle(&mut harness, &format!("full-list{suffix}"));
+        if let Some(row) = with_lyrics(harness.state(), true) {
+            harness.state_mut().apply(Action::PlayRow(row));
+            harness.state_mut().apply(Action::Minimize);
+            harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(40)).unwrap();
+            settle(&mut harness, &format!("full-list-playing{suffix}"));
+            harness.state_mut().apply(Action::Expand);
+            settle(&mut harness, &format!("full-now-playing{suffix}"));
+            harness.state_mut().apply(Action::ShowCardTab(CardTab::Queue));
+            settle(&mut harness, &format!("full-queue{suffix}"));
+            harness.state_mut().apply(Action::ShowCardTab(CardTab::Lyrics));
+            harness.state_mut().apply(Action::Minimize);
+        }
+    }
+    harness.state_mut().search = "love".to_owned();
+    settle(&mut harness, "full-search");
 }
 
-/// The window has no frame, so these buttons are the only way to close or minimize it.
+#[test]
+fn full_layout_lists_searches_and_plays() {
+    let folder = TestFolder::new("full");
+    let mut harness = harness_for(&folder);
+    harness.set_size(egui::vec2(1280.0, 780.0));
+    harness.state_mut().full = true;
+    harness.run_steps(4);
+
+    harness.get_by_label("Play playlist");
+    harness.get_by_label("Shuffle play");
+    harness.get_by_label("Restore");
+    assert!(harness.query_by_label("Maximize").is_none(), "the full layout restores instead");
+    click(&mut harness, "Liked Songs");
+    assert_eq!(harness.state().view, ALL_SONGS, "an empty Liked Songs does not open");
+
+    harness.state_mut().search = "LONG".to_owned();
+    harness.run_steps(2);
+    assert_eq!(harness.state().visible_rows(), [2], "search ignores case");
+    assert!(harness.query_by_label("1. a short").is_none());
+    click(&mut harness, "3. c long");
+    assert_eq!(current_title(&harness), "c long", "the row keeps its place in the playlist");
+
+    click(&mut harness, "Now Playing");
+    assert!(!harness.state().minimized);
+    harness.get_by_label("Like");
+    click(&mut harness, "Queue");
+    assert_eq!(harness.state().card_tab, CardTab::Queue);
+    click(&mut harness, "Back to song list");
+    assert!(harness.state().minimized);
+    harness.get_by_label("Open Now Playing: c long");
+
+    harness.state_mut().search = "nothing like this".to_owned();
+    harness.run_steps(2);
+    assert!(harness.state().visible_rows().is_empty());
+    harness.state_mut().full = false;
+    assert_eq!(harness.state().visible_rows().len(), 4, "the compact layout has no search box");
+}
+
+#[test]
+fn space_types_into_the_search_box() {
+    let folder = TestFolder::new("search-space");
+    let mut harness = harness_for(&folder);
+    harness.set_size(egui::vec2(1280.0, 780.0));
+    harness.state_mut().full = true;
+    harness.run_steps(4);
+    click(&mut harness, "3. c long");
+
+    harness.get_by_role(Role::TextInput).focus();
+    harness.run_steps(2);
+    press_space(&mut harness, 0);
+    assert!(!is_paused(&harness), "Space paused while typing a search");
+}
+
+/// The window has no frame, so these buttons are the only way to minimize or maximize it.
+/// Close keeps the music playing and never quits. Tests have no tray icon, so it minimizes.
 #[test]
 fn title_bar_buttons_command_the_window() {
     let folder = TestFolder::new("window");
     let mut harness = harness_for(&folder);
-    let mut pressed = |label: &str, wanted: egui::ViewportCommand| {
+    click(&mut harness, "3. c long");
+    let commands = |harness: &mut Harness<'static, App>, label: &str| {
         harness.get_by_label(label).click();
-        let mut sent = false;
+        let mut sent = Vec::new();
         for _ in 0..4 {
             harness.step();
-            let output = &harness.output().viewport_output[&egui::ViewportId::ROOT];
-            sent |= output.commands.contains(&wanted);
+            sent.extend(harness.output().viewport_output[&egui::ViewportId::ROOT].commands.iter().cloned());
         }
-        assert!(sent, "{label} did not send {wanted:?}");
+        sent
     };
-    pressed("Minimize", egui::ViewportCommand::Minimized(true));
-    pressed("Close", egui::ViewportCommand::Close);
+    assert!(commands(&mut harness, "Minimize").contains(&egui::ViewportCommand::Minimized(true)));
+    assert!(commands(&mut harness, "Maximize").contains(&egui::ViewportCommand::Maximized(true)));
+    let close = commands(&mut harness, "Close");
+    assert!(close.contains(&egui::ViewportCommand::Minimized(true)), "Close sent {close:?}");
+    assert!(!close.contains(&egui::ViewportCommand::Close), "Close must not quit");
+    assert!(!is_paused(&harness), "the music keeps playing");
+
+    harness.set_size(egui::vec2(1280.0, 780.0));
+    harness.state_mut().full = true;
+    harness.run_steps(4);
+    assert!(commands(&mut harness, "Restore").contains(&egui::ViewportCommand::Maximized(false)));
+    let close = commands(&mut harness, "Close");
+    assert!(close.contains(&egui::ViewportCommand::Minimized(true)) && !close.contains(&egui::ViewportCommand::Close));
 }
 
 #[test]
@@ -694,4 +772,107 @@ fn an_empty_start_offers_to_open_a_folder() {
     harness.run_steps(3);
     harness.get_by_label("Open folder");
     harness.get_by_label("Open music folder");
+}
+
+#[cfg(windows)]
+#[test]
+fn media_keys_play_pause_and_skip() {
+    use crate::media_controls::MediaButton;
+
+    let folder = TestFolder::new("media-keys");
+    let mut harness = harness_for(&folder);
+
+    harness.state_mut().press(MediaButton::Play);
+    harness.run_steps(2);
+    assert_eq!(current_title(&harness), "a short", "Play with nothing loaded starts the shown playlist");
+    harness.state_mut().apply(Action::PlayRow(2));
+    harness.run_steps(2);
+    assert_eq!(current_title(&harness), "c long");
+
+    harness.state_mut().press(MediaButton::Pause);
+    assert!(is_paused(&harness));
+    harness.state_mut().press(MediaButton::Pause);
+    assert!(is_paused(&harness), "a second Pause keeps it paused");
+    harness.state_mut().press(MediaButton::Play);
+    assert!(!is_paused(&harness));
+    harness.state_mut().press(MediaButton::Play);
+    assert!(!is_paused(&harness), "a second Play keeps it playing");
+
+    harness.state_mut().press(MediaButton::Next);
+    assert_eq!(current_title(&harness), "d corrupt");
+    harness.state_mut().press(MediaButton::Previous);
+    assert_eq!(current_title(&harness), "c long");
+}
+
+fn space_event(harness: &mut Harness<'static, App>, pressed: bool, repeat: bool) {
+    harness.input_mut().events.push(egui::Event::Key {
+        key: egui::Key::Space,
+        physical_key: None,
+        pressed,
+        repeat,
+        modifiers: egui::Modifiers::NONE,
+    });
+    harness.run_steps(2);
+}
+
+/// Presses Space, with `repeats` extra presses from holding it down, then lets go.
+fn press_space(harness: &mut Harness<'static, App>, repeats: usize) {
+    space_event(harness, true, false);
+    for _ in 0..repeats {
+        space_event(harness, true, true);
+    }
+    space_event(harness, false, false);
+}
+
+#[test]
+fn space_pauses_and_resumes() {
+    let folder = TestFolder::new("space");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+
+    press_space(&mut harness, 0);
+    assert!(is_paused(&harness));
+    press_space(&mut harness, 3);
+    assert!(!is_paused(&harness), "holding the key toggles once");
+
+    // Space would click a focused button too. Only one toggle may happen.
+    harness.get_by_label("Pause").focus();
+    harness.run_steps(2);
+    press_space(&mut harness, 0);
+    assert!(is_paused(&harness), "Space toggled twice");
+}
+
+/// A maximized window must leave the taskbar visible. Checks the size limit that Windows asks
+/// for when it maximizes, on a hidden window that is never shown.
+#[cfg(windows)]
+#[test]
+fn maximizing_stops_at_the_taskbar() {
+    use windows::{
+        Win32::{
+            Foundation::{LPARAM, RECT, WPARAM},
+            UI::WindowsAndMessaging::{
+                CreateWindowExW, DestroyWindow, MINMAXINFO, SPI_GETWORKAREA, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
+                SendMessageW, SystemParametersInfoW, WINDOW_EX_STYLE, WM_GETMINMAXINFO, WS_POPUP,
+            },
+        },
+        core::w,
+    };
+
+    // SAFETY: The window is hidden, belongs to this thread, and is destroyed below. The
+    // pointers passed to Windows point at live values of the types each call expects.
+    unsafe {
+        let window =
+            CreateWindowExW(WINDOW_EX_STYLE(0), w!("STATIC"), w!("amplo test"), WS_POPUP, 0, 0, 100, 100, None, None, None, None)
+                .unwrap();
+        crate::keep_taskbar_visible(window);
+        let mut limits = MINMAXINFO::default();
+        SendMessageW(window, WM_GETMINMAXINFO, Some(WPARAM(0)), Some(LPARAM(&raw mut limits as isize)));
+        let mut work = RECT::default();
+        SystemParametersInfoW(SPI_GETWORKAREA, 0, Some((&raw mut work).cast()), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0))
+            .unwrap();
+        DestroyWindow(window).unwrap();
+
+        assert_eq!(limits.ptMaxSize.x, work.right - work.left);
+        assert_eq!(limits.ptMaxSize.y, work.bottom - work.top);
+    }
 }

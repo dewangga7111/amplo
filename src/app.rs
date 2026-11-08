@@ -25,6 +25,10 @@ use amplo::{
 };
 use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
+#[cfg(windows)]
+use crate::media_controls::{MediaButton, MediaControls, NowPlaying, Status};
+#[cfg(windows)]
+use crate::tray::{Tray, TrayCommand};
 use crate::{covers::Covers, theme};
 
 pub const APP_NAME: &str = "amplo";
@@ -49,7 +53,7 @@ pub struct Queue {
 }
 
 /// What the card beside the cover shows in Now Playing.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CardTab {
     Lyrics,
     Queue,
@@ -67,6 +71,10 @@ pub enum Action {
     PlayQueue(usize),
     ShowCardTab(CardTab),
     OpenPlaylist(usize),
+    /// Maximizes the window, which switches to the full layout, or restores the compact one.
+    ToggleFull,
+    /// The close button. The window hides in the notification area and the music keeps playing.
+    HideToTray,
     Expand,
     Minimize,
     ToggleLike,
@@ -142,7 +150,17 @@ pub struct App {
     pub mini: f32,
     /// When long titles in Now Playing started from their beginning, in UI time.
     pub marquee_started: f64,
+    /// True while the window is maximized, which shows the full layout.
+    pub full: bool,
+    /// The search box of the full layout. It filters the shown playlist.
+    pub search: String,
     window_title: String,
+    /// Media keys and the Windows media panel. Missing in tests, which have no window.
+    #[cfg(windows)]
+    media: Option<MediaControls>,
+    /// The notification area icon. Missing in tests, which have no window.
+    #[cfg(windows)]
+    tray: Option<Tray>,
 }
 
 pub fn format_time(seconds: f32) -> String {
@@ -254,7 +272,13 @@ impl App {
             slide: 0.0,
             mini: 0.0,
             marquee_started: 0.0,
+            full: false,
+            search: String::new(),
             window_title: APP_NAME.to_owned(),
+            #[cfg(windows)]
+            media: None,
+            #[cfg(windows)]
+            tray: None,
         };
         if !startup_paths.is_empty() {
             let kind = LoadKind::Open { autoplay: true, roots: startup_paths.clone(), folder: None };
@@ -464,6 +488,22 @@ impl App {
         self.player.as_ref().is_some_and(|player| !player.is_paused())
     }
 
+    /// The rows of the shown playlist that match the search, by their position in it. The
+    /// search applies to the full layout only, where its box is.
+    pub fn visible_rows(&self) -> Vec<usize> {
+        let Some(playlist) = self.library.playlists.get(self.view) else { return Vec::new() };
+        let query = self.search.trim().to_lowercase();
+        if !self.full || query.is_empty() {
+            return (0..playlist.tracks.len()).collect();
+        }
+        (0..playlist.tracks.len())
+            .filter(|&row| {
+                let info = &self.library.tracks[playlist.tracks[row]].info;
+                [&info.title, &info.artist, &info.album].iter().any(|text| text.to_lowercase().contains(&query))
+            })
+            .collect()
+    }
+
     pub fn is_liked(&self, track: usize) -> bool {
         self.library.tracks.get(track).is_some_and(|track| self.settings.liked.contains(&track.path))
     }
@@ -651,7 +691,14 @@ impl App {
             Action::Toggle => self.toggle(),
             Action::Next => self.next(),
             Action::Previous => self.previous(),
-            Action::PlayRow(row) => self.play_view(Some(row)),
+            Action::PlayRow(row) => {
+                self.play_view(Some(row));
+                // A chosen song opens Now Playing, where it shows.
+                if self.current_track().is_some() {
+                    self.minimized = false;
+                    self.restart_marquee();
+                }
+            }
             Action::PlayView => self.play_view(None),
             Action::ShufflePlayView => {
                 self.shuffle = true;
@@ -668,12 +715,93 @@ impl App {
                 self.restart_marquee();
             }
             Action::Minimize => self.minimized = true,
+            Action::ToggleFull => self.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!self.full)),
+            Action::HideToTray => self.hide_to_tray(),
             Action::ToggleLike => self.toggle_like(),
             Action::ToggleShuffle => self.toggle_shuffle(),
             Action::ToggleRepeat => self.repeat = !self.repeat,
             Action::OpenFolder => self.open_folder(),
             Action::Seek(seconds) => self.seek(seconds),
             Action::SaveSettings => self.save_settings(),
+        }
+    }
+
+    /// Without a tray icon, a hidden window could not be brought back, so it only minimizes.
+    fn hide_to_tray(&mut self) {
+        #[cfg(windows)]
+        if let Some(tray) = &mut self.tray
+            && tray.show_icon()
+        {
+            self.ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            return;
+        }
+        self.ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+    }
+
+    /// The icon stays in the notification area for as long as the app runs, as Spotify's does.
+    #[cfg(windows)]
+    pub fn attach_tray(&mut self, window: windows::Win32::Foundation::HWND) {
+        self.tray = Tray::new(window);
+        if let Some(tray) = &mut self.tray {
+            tray.show_icon();
+        }
+    }
+
+    /// eframe still updates a hidden window ten times a second, so a click shows within that.
+    #[cfg(windows)]
+    fn poll_tray(&mut self, ctx: &egui::Context) {
+        let Some(tray) = &mut self.tray else { return };
+        match tray.take_command() {
+            Some(TrayCommand::Show) => {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            Some(TrayCommand::Quit) => {
+                tray.hide_icon();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
+            None => {}
+        }
+    }
+
+    /// Without the controls, the app still plays. Only media keys and the panel are missing.
+    #[cfg(windows)]
+    pub fn attach_media_controls(&mut self, window: windows::Win32::Foundation::HWND) {
+        let ctx = self.ctx.clone();
+        self.media = MediaControls::new(window, move || ctx.request_repaint()).ok();
+    }
+
+    /// Windows sends Play to a paused player and Pause to a playing one. Each is checked
+    /// anyway, so a key pressed twice in quick succession cannot undo itself.
+    #[cfg(windows)]
+    pub fn press(&mut self, button: MediaButton) {
+        match button {
+            MediaButton::Play if !self.is_playing() => self.toggle(),
+            MediaButton::Pause if self.is_playing() => self.toggle(),
+            MediaButton::Play | MediaButton::Pause => {}
+            MediaButton::Next => self.next(),
+            MediaButton::Previous => self.previous(),
+        }
+    }
+
+    #[cfg(windows)]
+    fn sync_media_controls(&mut self) {
+        let Some(media) = &self.media else { return };
+        for button in media.presses() {
+            self.press(button);
+        }
+        let now = self.current_track().map(|track| {
+            let track = &self.library.tracks[track];
+            NowPlaying { path: track.path.clone(), title: track.info.title.clone(), artist: track.info.artist.clone() }
+        });
+        let status = match &self.player {
+            None => Status::Stopped,
+            Some(player) if player.is_paused() => Status::Paused,
+            Some(_) => Status::Playing,
+        };
+        if let Some(media) = &mut self.media {
+            media.update(now, status);
         }
     }
 
@@ -684,6 +812,10 @@ impl App {
         if self.player.as_ref().is_some_and(Player::empty) {
             self.advance();
         }
+        #[cfg(windows)]
+        self.sync_media_controls();
+        #[cfg(windows)]
+        self.poll_tray(ctx);
         self.sync_window_title(ctx);
         if self.is_playing() {
             ctx.request_repaint_after(TICK);

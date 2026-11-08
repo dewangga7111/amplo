@@ -28,6 +28,16 @@ pub const MINI_LINE: Color32 = Color32::from_rgb(0x2A, 0x2E, 0x35);
 pub const CHEVRON: Color32 = Color32::from_rgb(0xC9, 0xCD, 0xD3);
 pub const WARNING: Color32 = Color32::from_rgb(0xFF, 0x9A, 0x5C);
 
+/// Colors that only the full layout uses.
+pub const FULL_BACKGROUND: Color32 = Color32::from_rgb(0x0E, 0x0F, 0x12);
+pub const FULL_ROW_HOVER: Color32 = Color32::from_rgb(0x18, 0x1B, 0x20);
+pub const SIDEBAR_LINE: Color32 = Color32::from_rgb(0x23, 0x26, 0x2C);
+pub const TITLE_LINE: Color32 = Color32::from_rgb(0x1E, 0x21, 0x26);
+pub const TABLE_LINE: Color32 = Color32::from_rgb(0x22, 0x25, 0x2B);
+pub const PILL_LINE: Color32 = Color32::from_rgb(0x2C, 0x30, 0x38);
+pub const FIELD_LINE: Color32 = Color32::from_rgb(0x26, 0x2A, 0x31);
+pub const FULL_MINI: Color32 = Color32::from_rgb(0x1A, 0x1D, 0x22);
+
 pub const LOGO: ImageSource<'static> = include_image!("../assets/icons/logo.svg");
 pub const MINIMIZE: ImageSource<'static> = include_image!("../assets/icons/minimize.svg");
 pub const CLOSE: ImageSource<'static> = include_image!("../assets/icons/close.svg");
@@ -44,6 +54,10 @@ pub const VOLUME: ImageSource<'static> = include_image!("../assets/icons/volume.
 pub const CHEVRON_UP: ImageSource<'static> = include_image!("../assets/icons/chevron-up.svg");
 pub const CHEVRON_DOWN: ImageSource<'static> = include_image!("../assets/icons/chevron-down.svg");
 pub const NOTE: ImageSource<'static> = include_image!("../assets/icons/note.svg");
+pub const MAXIMIZE: ImageSource<'static> = include_image!("../assets/icons/maximize.svg");
+pub const RESTORE: ImageSource<'static> = include_image!("../assets/icons/restore.svg");
+pub const SEARCH: ImageSource<'static> = include_image!("../assets/icons/search.svg");
+pub const DISC: ImageSource<'static> = include_image!("../assets/icons/disc.svg");
 
 const FONTS: [(&str, &[u8]); 6] = [
     ("inter", include_bytes!("../assets/fonts/Inter-Regular.ttf")),
