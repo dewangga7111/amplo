@@ -251,6 +251,27 @@ fn previous_restarts_a_track_after_three_seconds() {
     assert!(position(&harness) < 3.0);
 }
 
+/// After sleep, Windows stops the audio stream. Its error callback sets the same flag.
+#[test]
+fn a_lost_audio_output_opens_again_and_continues_the_track() {
+    let folder = TestFolder::new("audio-lost");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(8)).unwrap();
+    click(&mut harness, "Pause");
+    let lost = std::sync::Arc::clone(&harness.state().audio_lost);
+
+    lost.store(true, std::sync::atomic::Ordering::Relaxed);
+    harness.run_steps(2);
+    assert!(!lost.load(std::sync::atomic::Ordering::Relaxed), "the output was not opened again");
+    assert_eq!(current_title(&harness), "c long");
+    assert!(is_paused(&harness), "a paused track stays paused");
+    assert!((position(&harness) - 8.0).abs() < 0.5, "continued at {}", position(&harness));
+
+    click(&mut harness, "Play");
+    wait_until(&mut harness, "playback", |app| app.player.as_ref().unwrap().get_pos() > Duration::from_millis(8300));
+}
+
 #[test]
 fn track_end_skips_broken_files_and_keeps_the_message() {
     let folder = TestFolder::new("skip");

@@ -7,11 +7,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use eframe::egui;
@@ -40,6 +40,10 @@ const SCAN_REPAINT_EVERY: usize = 32;
 /// Previous restarts the track after this much of it has played.
 const RESTART_AFTER: Duration = Duration::from_secs(3);
 const NO_AUDIO: &str = "No audio files found in that folder.";
+/// Shown while the audio output cannot be opened again, for example right after sleep.
+const NO_OUTPUT: &str = "No audio output";
+/// How often a lost audio output is opened again until a device answers.
+const REOPEN_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Queue {
     /// `None` once a rescan finds that the playlist no longer exists.
@@ -134,6 +138,10 @@ pub struct App {
     scan_events: Receiver<ScanEvent>,
     /// Opened on first playback, so a missing audio device shows as an error and not a crash.
     sink: Option<MixerDeviceSink>,
+    /// Set by the audio thread when the output stops, as it does after sleep or when the
+    /// device goes away. Also set when Windows picks another default device.
+    pub audio_lost: Arc<AtomicBool>,
+    last_reopen: Option<Instant>,
     /// One `Player` per track. Dropping it stops the track.
     pub player: Option<Player>,
     pub duration: Option<Duration>,
@@ -259,6 +267,8 @@ impl App {
             events,
             scan_events,
             sink: None,
+            audio_lost: Arc::new(AtomicBool::new(false)),
+            last_reopen: None,
             player: None,
             duration: None,
             seek_preview: None,
@@ -562,7 +572,7 @@ impl App {
         self.library.tracks[track].info = info.clone();
         self.lyrics = Lyrics::for_track(&path);
 
-        let started = self.start(&path);
+        let started = self.start(&path, false);
         self.tech = tech_lines(&path, &info, started.as_ref().ok().copied(), self.duration);
         self.error = started.err().map(|err| format!("{}: {err}", info.title));
     }
@@ -571,19 +581,37 @@ impl App {
         self.marquee_started = self.ctx.input(|input| input.time);
     }
 
+    /// Opens the default output device. Its errors mark the output as lost, and the next
+    /// update opens it again. See [`App::recover_audio`].
+    fn open_sink(&self) -> Result<MixerDeviceSink, String> {
+        let lost = Arc::clone(&self.audio_lost);
+        let ctx = self.ctx.clone();
+        let mut sink = DeviceSinkBuilder::from_default_device()
+            .map_err(|err| err.to_string())?
+            .with_error_callback(move |_| {
+                lost.store(true, Ordering::Relaxed);
+                ctx.request_repaint();
+            })
+            .open_sink_or_fallback()
+            .map_err(|err| err.to_string())?;
+        sink.log_on_drop(false);
+        Ok(sink)
+    }
+
     /// Returns the sample rate and channel count of the decoded audio.
-    fn start(&mut self, path: &Path) -> Result<(u32, u16), String> {
+    fn start(&mut self, path: &Path, paused: bool) -> Result<(u32, u16), String> {
         let source = open_source(path)?;
         if self.sink.is_none() {
-            let mut sink = DeviceSinkBuilder::open_default_sink().map_err(|err| err.to_string())?;
-            sink.log_on_drop(false);
-            self.sink = Some(sink);
+            self.sink = Some(self.open_sink()?);
         }
         let Some(sink) = &self.sink else {
             unreachable!("sink was opened above");
         };
         let format = (source.sample_rate().get(), source.channels().get());
         let player = Player::connect_new(sink.mixer());
+        if paused {
+            player.pause();
+        }
         player.set_volume(self.settings.volume);
         self.duration = source.total_duration();
         player.append(Tap::new(source, Arc::clone(&self.samples)));
@@ -805,10 +833,57 @@ impl App {
         }
     }
 
+    /// Windows stops the audio stream when the PC sleeps or the device goes away, and the
+    /// track then stands still. This opens the output again and continues the track where it
+    /// was, playing or paused as before. Until a device answers, it tries again each second.
+    fn recover_audio(&mut self, ctx: &egui::Context) {
+        if !self.audio_lost.load(Ordering::Relaxed) {
+            return;
+        }
+        if self.sink.is_none() {
+            // Nothing is open, so the next track opens a new output anyway.
+            self.audio_lost.store(false, Ordering::Relaxed);
+            return;
+        }
+        if self.last_reopen.is_some_and(|last| last.elapsed() < REOPEN_INTERVAL) {
+            ctx.request_repaint_after(REOPEN_INTERVAL);
+            return;
+        }
+        self.last_reopen = Some(Instant::now());
+        self.audio_lost.store(false, Ordering::Relaxed);
+        let sink = match self.open_sink() {
+            Ok(sink) => sink,
+            Err(err) => {
+                self.audio_lost.store(true, Ordering::Relaxed);
+                self.error = Some(format!("{NO_OUTPUT}: {err}"));
+                ctx.request_repaint_after(REOPEN_INTERVAL);
+                return;
+            }
+        };
+        if self.error.as_deref().is_some_and(|error| error.starts_with(NO_OUTPUT)) {
+            self.error = None;
+        }
+        let resume = self.player.take().map(|player| (player.get_pos(), player.is_paused()));
+        self.sink = Some(sink);
+        let (Some((position, paused)), Some(track)) = (resume, self.current_track()) else { return };
+        let path = self.library.tracks[track].path.clone();
+        match self.start(&path, paused) {
+            Ok(_) => {
+                if let Some(player) = &self.player
+                    && let Err(err) = player.try_seek(position)
+                {
+                    self.error = Some(format!("Could not seek: {err}"));
+                }
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
     /// Follows the playing audio. Runs while the window is minimized too.
     pub fn update_playback(&mut self, ctx: &egui::Context) {
         self.receive_scan_events();
         self.covers.poll(ctx);
+        self.recover_audio(ctx);
         if self.player.as_ref().is_some_and(Player::empty) {
             self.advance();
         }
