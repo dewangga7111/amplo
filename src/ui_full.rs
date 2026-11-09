@@ -131,7 +131,7 @@ impl App {
         let field_left = rect.left() + 32.0;
         let field_width = 340.0_f32.min(minimize.left() - 24.0 - field_left).max(0.0);
         let field = Rect::from_min_size(pos2(field_left, center_y - 18.0), vec2(field_width, 36.0));
-        self.draw_search(ui, field);
+        self.draw_search(ui, field, actions);
 
         if let Some(error) = &self.error {
             let left = field.right() + 16.0;
@@ -144,7 +144,7 @@ impl App {
         }
     }
 
-    fn draw_search(&mut self, ui: &mut Ui, field: Rect) {
+    fn draw_search(&mut self, ui: &mut Ui, field: Rect, actions: &mut Vec<Action>) {
         ui.painter().rect(field, 10.0, theme::PANEL, Stroke::new(1.0, theme::FIELD_LINE), egui::StrokeKind::Inside);
         let icon = Rect::from_min_size(pos2(field.left() + 12.0, field.top() + 10.0), Vec2::splat(16.0));
         paint_icon(ui, icon, theme::SEARCH, theme::MUTED);
@@ -161,6 +161,10 @@ impl App {
             .align(Align2::LEFT_CENTER)
             .desired_width(text.width());
         let response = ui.put(text, edit);
+        // The results show in the song list, which Now Playing covers.
+        if response.changed() && !self.search.trim().is_empty() {
+            actions.push(Action::Minimize);
+        }
         if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Escape)) {
             self.search.clear();
         }

@@ -753,6 +753,27 @@ fn space_types_into_the_search_box() {
     assert!(!is_paused(&harness), "Space paused while typing a search");
 }
 
+/// Now Playing covers the song list, where the results show.
+#[test]
+fn typing_a_search_shows_the_song_list() {
+    let folder = TestFolder::new("search-list");
+    let mut harness = harness_for(&folder);
+    harness.set_size(egui::vec2(1280.0, 780.0));
+    harness.state_mut().full = true;
+    harness.run_steps(4);
+    click(&mut harness, "3. c long");
+    assert!(!harness.state().minimized, "a clicked song opens Now Playing");
+
+    harness.get_by_role(Role::TextInput).focus();
+    harness.run_steps(2);
+    harness.get_by_role(Role::TextInput).type_text("short");
+    harness.run_steps(2);
+    assert_eq!(harness.state().search, "short");
+    assert!(harness.state().minimized, "Now Playing still covers the results");
+    harness.get_by_label("1. a short");
+    assert!(!is_paused(&harness), "the music keeps playing");
+}
+
 /// The window has no frame, so these buttons are the only way to minimize or maximize it.
 /// Close keeps the music playing and never quits. Tests have no tray icon, so it minimizes.
 #[test]
