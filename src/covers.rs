@@ -230,6 +230,77 @@ impl Covers {
     }
 }
 
+/// Covers from the web, such as those of Spotify playlists. They load on their own thread,
+/// so a slow network does not hold up the covers of local files.
+pub struct WebCovers {
+    requests: Sender<String>,
+    results: Receiver<(String, Option<ColorImage>)>,
+    slots: HashMap<String, Slot>,
+}
+
+/// Newest request first, as for local covers, so the rows on screen come before those
+/// scrolled past.
+fn run_web_worker(requests: &Receiver<String>, results: &Sender<(String, Option<ColorImage>)>, ctx: &egui::Context) {
+    let agent: ureq::Agent =
+        ureq::Agent::config_builder().timeout_global(Some(std::time::Duration::from_secs(15))).build().into();
+    let mut pending = Vec::new();
+    loop {
+        if pending.is_empty() {
+            match requests.recv() {
+                Ok(url) => pending.push(url),
+                Err(_) => return,
+            }
+        }
+        pending.extend(requests.try_iter());
+        let Some(url) = pending.pop() else { continue };
+        let bytes = agent.get(&url).call().ok().and_then(|mut response| response.body_mut().read_to_vec().ok());
+        let image = bytes.and_then(|bytes| decode_cover(&bytes, MAX_SIZE));
+        if results.send((url, image)).is_err() {
+            return;
+        }
+        ctx.request_repaint();
+    }
+}
+
+impl WebCovers {
+    /// Many more than local covers fit, because each Spotify song has one.
+    const LIMIT: usize = 512;
+
+    pub fn new(ctx: &egui::Context) -> Self {
+        let (requests, worker_requests) = mpsc::channel();
+        let (worker_results, results) = mpsc::channel();
+        let worker_ctx = ctx.clone();
+        thread::spawn(move || run_web_worker(&worker_requests, &worker_results, &worker_ctx));
+        Self { requests, results, slots: HashMap::new() }
+    }
+
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        for (url, image) in self.results.try_iter() {
+            let slot = match image {
+                Some(image) => Slot::Ready(ctx.load_texture(format!("web-cover-{url}"), image, TextureOptions::LINEAR)),
+                None => Slot::Missing,
+            };
+            self.slots.insert(url, slot);
+        }
+    }
+
+    /// The picture at `url`, once it has loaded.
+    pub fn texture(&mut self, url: &str) -> Option<TextureId> {
+        if !self.slots.contains_key(url) {
+            if self.slots.len() > Self::LIMIT {
+                self.slots.retain(|_, slot| matches!(slot, Slot::Loading));
+            }
+            // The worker only stops when this struct is gone.
+            let _ = self.requests.send(url.to_owned());
+            self.slots.insert(url.to_owned(), Slot::Loading);
+        }
+        match self.slots.get(url) {
+            Some(Slot::Ready(texture)) => Some(texture.id()),
+            _ => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

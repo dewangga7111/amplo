@@ -6,4 +6,5 @@ mod media_foundation;
 mod opus;
 pub mod settings;
 pub mod spectrum;
+pub mod spotify;
 pub mod watch;

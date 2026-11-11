@@ -49,10 +49,28 @@ pub enum TrayCommand {
     Quit,
 }
 
+/// Wakes the app, which otherwise sleeps while its window is hidden and nothing plays.
+type Wake = Box<dyn Fn()>;
+
 pub struct Tray {
     window: HWND,
     icon: HICON,
     shown: bool,
+    /// Only the window procedure calls it, through its data. Boxed twice, so that is a thin
+    /// pointer, which stays valid until `drop` has removed the procedure.
+    _wake: Box<Wake>,
+}
+
+/// Leaves a command for the app, and wakes it to take it.
+///
+/// # Safety
+///
+/// `wake` must be the pointer that [`Tray::new`] gave the window procedure.
+unsafe fn send(command: u8, wake: usize) {
+    COMMAND.store(command, Ordering::Relaxed);
+    // SAFETY: The caller passes the pointer to the `Wake` that the `Tray` owns, and the
+    // procedure is removed before that is freed.
+    unsafe { (*(wake as *const Wake))() };
 }
 
 unsafe extern "system" fn on_message(
@@ -61,12 +79,13 @@ unsafe extern "system" fn on_message(
     wparam: WPARAM,
     lparam: LPARAM,
     _id: usize,
-    _data: usize,
+    wake: usize,
 ) -> LRESULT {
     match message {
         WM_TRAY => {}
         WM_SHOW_INSTANCE => {
-            COMMAND.store(SHOW, Ordering::Relaxed);
+            // SAFETY: `wake` is the data `Tray::new` set for this procedure.
+            unsafe { send(SHOW, wake) };
             return LRESULT(0);
         }
         _ => {
@@ -86,14 +105,18 @@ unsafe extern "system" fn on_message(
         }
     }
     // Without a version set, the low bits of `lparam` hold the mouse message.
-    match lparam.0 as u32 & 0xFFFF {
-        WM_LBUTTONUP => COMMAND.store(SHOW, Ordering::Relaxed),
+    let command = match lparam.0 as u32 & 0xFFFF {
+        WM_LBUTTONUP => SHOW,
         WM_RBUTTONUP => match show_menu(window) {
-            MENU_OPEN => COMMAND.store(SHOW, Ordering::Relaxed),
-            MENU_QUIT => COMMAND.store(QUIT, Ordering::Relaxed),
-            _ => {}
+            MENU_OPEN => SHOW,
+            MENU_QUIT => QUIT,
+            _ => NO_COMMAND,
         },
-        _ => {}
+        _ => NO_COMMAND,
+    };
+    if command != NO_COMMAND {
+        // SAFETY: `wake` is the data `Tray::new` set for this procedure.
+        unsafe { send(command, wake) };
     }
     LRESULT(0)
 }
@@ -158,10 +181,15 @@ pub fn show_running_instance() -> bool {
 impl Tray {
     /// Listens for clicks on the icon, and marks the window so a second start of the app finds
     /// it. See [`show_running_instance`]. The icon shows with [`Tray::show_icon`].
-    pub fn new(window: HWND) -> Option<Self> {
+    ///
+    /// `wake` runs on the window's thread after each click, so the app takes the command
+    /// even while it sleeps.
+    pub fn new(window: HWND, wake: impl Fn() + 'static) -> Option<Self> {
+        let wake: Box<Wake> = Box::new(Box::new(wake));
         // SAFETY: The resource number stands in for a name, as `LoadImageW` documents. The
-        // window belongs to this thread, as subclassing requires, and the procedure stays valid
-        // for the life of the process.
+        // window belongs to this thread, as subclassing requires. The procedure stays valid
+        // for the life of the process, and its data for the life of `Tray`, whose `drop`
+        // removes the procedure.
         unsafe {
             let module = GetModuleHandleW(None).ok()?;
             let (width, height) = (GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
@@ -171,9 +199,10 @@ impl Tray {
                 Ok(icon) => HICON(icon.0),
                 Err(_) => LoadIconW(None, IDI_APPLICATION).ok()?,
             };
-            SetWindowSubclass(window, Some(on_message), SUBCLASS_ID, 0).ok().ok()?;
+            let data = (&raw const *wake) as usize;
+            SetWindowSubclass(window, Some(on_message), SUBCLASS_ID, data).ok().ok()?;
             let _ = SetPropW(window, INSTANCE_PROPERTY, Some(HANDLE(1 as *mut _)));
-            Some(Self { window, icon, shown: false })
+            Some(Self { window, icon, shown: false, _wake: wake })
         }
     }
 
@@ -261,13 +290,17 @@ mod tests {
                 None,
             )
             .unwrap();
-            let tray = Tray::new(window).unwrap();
+            let wakes = std::rc::Rc::new(std::cell::Cell::new(0));
+            let counter = std::rc::Rc::clone(&wakes);
+            let tray = Tray::new(window, move || counter.set(counter.get() + 1)).unwrap();
             assert_eq!(tray.take_command(), None);
             SendMessageW(window, WM_TRAY, Some(WPARAM(1)), Some(LPARAM(WM_LBUTTONUP as isize)));
             assert_eq!(tray.take_command(), Some(TrayCommand::Show));
             assert_eq!(tray.take_command(), None, "a click is taken once");
+            assert_eq!(wakes.get(), 1, "a sleeping app would never take the click");
             SendMessageW(window, WM_SHOW_INSTANCE, None, None);
             assert_eq!(tray.take_command(), Some(TrayCommand::Show), "a second start shows the window");
+            assert_eq!(wakes.get(), 2, "a sleeping app would never show the window");
             drop(tray);
             DestroyWindow(window).unwrap();
         }

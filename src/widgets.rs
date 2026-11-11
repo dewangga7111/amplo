@@ -291,6 +291,29 @@ pub fn pill_button(
     response
 }
 
+/// A rounded button with a text, filled with the accent color or outlined.
+pub fn text_button(ui: &Ui, rect: Rect, text: &str, filled: bool) -> Response {
+    let response = click_area(ui, rect, text);
+    let (fill, color) = match (filled, response.hovered()) {
+        (true, false) => (theme::ACCENT, theme::ON_ACCENT),
+        (true, true) => (theme::ACCENT_HOVER, theme::ON_ACCENT),
+        (false, false) => (Color32::TRANSPARENT, theme::TEXT),
+        (false, true) => (theme::ICON_HOVER, theme::TEXT),
+    };
+    let radius = rect.height() / 2.0;
+    let stroke = if filled { Stroke::NONE } else { Stroke::new(1.0, theme::PILL_LINE) };
+    ui.painter().rect(rect, radius, fill, stroke, StrokeKind::Inside);
+    let galley = line(ui, text, theme::inter_semibold(13.0), color, rect.width());
+    paint_text(ui, Align2::CENTER_CENTER, rect.center(), galley);
+    paint_focus(ui, &response, radius);
+    response
+}
+
+/// The width that `text_button` needs for `text`.
+pub fn button_width(ui: &Ui, text: &str) -> f32 {
+    line(ui, text, theme::inter_semibold(13.0), theme::TEXT, f32::INFINITY).size().x + 32.0
+}
+
 pub fn at(origin: Pos2, x: f32, y: f32, width: f32, height: f32) -> Rect {
     Rect::from_min_size(origin + vec2(x, y), vec2(width, height))
 }

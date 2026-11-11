@@ -23,10 +23,14 @@ pub const NAV_HOVER: Color32 = Color32::from_rgb(0x1E, 0x21, 0x26);
 pub const NAV_ACTIVE: Color32 = Color32::from_rgb(0x23, 0x26, 0x2C);
 pub const ROW_CURRENT: Color32 = Color32::from_rgb(0x1A, 0x1D, 0x22);
 pub const ROW_HOVER: Color32 = Color32::from_rgb(0x1C, 0x1F, 0x24);
+pub const ROW_SELECTED: Color32 = Color32::from_rgb(0x27, 0x2C, 0x33);
 pub const MINI: Color32 = Color32::from_rgb(0x1C, 0x1F, 0x24);
 pub const MINI_LINE: Color32 = Color32::from_rgb(0x2A, 0x2E, 0x35);
 pub const CHEVRON: Color32 = Color32::from_rgb(0xC9, 0xCD, 0xD3);
 pub const WARNING: Color32 = Color32::from_rgb(0xFF, 0x9A, 0x5C);
+/// A Spotify song that the local library has, and one that it lacks.
+pub const AVAILABLE: Color32 = Color32::from_rgb(0x5E, 0xE0, 0x8C);
+pub const MISSING: Color32 = Color32::from_rgb(0xFF, 0x6B, 0x6B);
 
 /// Colors that only the full layout uses.
 pub const FULL_BACKGROUND: Color32 = Color32::from_rgb(0x0E, 0x0F, 0x12);
@@ -58,6 +62,9 @@ pub const MAXIMIZE: ImageSource<'static> = include_image!("../assets/icons/maxim
 pub const RESTORE: ImageSource<'static> = include_image!("../assets/icons/restore.svg");
 pub const SEARCH: ImageSource<'static> = include_image!("../assets/icons/search.svg");
 pub const DISC: ImageSource<'static> = include_image!("../assets/icons/disc.svg");
+pub const FOLDER: ImageSource<'static> = include_image!("../assets/icons/folder.svg");
+pub const CLOUD: ImageSource<'static> = include_image!("../assets/icons/cloud.svg");
+pub const CHECK: ImageSource<'static> = include_image!("../assets/icons/check.svg");
 
 const FONTS: [(&str, &[u8]); 6] = [
     ("inter", include_bytes!("../assets/fonts/Inter-Regular.ttf")),
@@ -103,6 +110,13 @@ fn apply_style(style: &mut Style) {
     style.visuals.override_text_color = Some(TEXT);
     style.spacing.scroll = ScrollStyle::floating();
     style.text_styles.insert(TextStyle::Body, FontId::proportional(13.0));
+    // Menus set their own button padding. See `ui::roomy_menu`.
+    style.spacing.menu_margin = egui::Margin::same(6);
+    style.spacing.item_spacing.y = 2.0;
+    style.spacing.menu_width = 180.0;
+    for widget in [&mut style.visuals.widgets.hovered, &mut style.visuals.widgets.active] {
+        widget.corner_radius = egui::CornerRadius::same(6);
+    }
 }
 
 pub fn install(ctx: &egui::Context) {

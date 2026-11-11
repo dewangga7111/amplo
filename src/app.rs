@@ -1,7 +1,7 @@
 //! The state of the player, and everything it does apart from drawing.
 
 use std::{
-    collections::{HashMap, HashSet, hash_map::RandomState},
+    collections::{BTreeSet, HashMap, HashSet, hash_map::RandomState},
     fs,
     hash::{BuildHasher, Hasher},
     path::{Path, PathBuf},
@@ -18,18 +18,29 @@ use eframe::egui;
 use amplo::{
     audio::open_source,
     library::{self, ALL_SONGS, LIKED_SONGS, Library, TrackInfo},
-    lyrics::Lyrics,
+    lyrics::{Extra, Lyrics},
     settings::Settings,
     spectrum::{Analyzer, SampleBuffer, Tap},
     watch::FolderWatcher,
 };
-use rodio::{DeviceSinkBuilder, MixerDeviceSink, Player, Source};
+use rodio::{
+    DeviceSinkBuilder, DeviceSinkError, MixerDeviceSink, Player, Source,
+    cpal::{
+        self,
+        traits::{DeviceTrait, HostTrait},
+    },
+};
 
 #[cfg(windows)]
 use crate::media_controls::{MediaButton, MediaControls, NowPlaying, Status};
 #[cfg(windows)]
 use crate::tray::{Tray, TrayCommand};
-use crate::{covers::Covers, theme};
+use crate::{
+    covers::Covers,
+    spotify_page::{SpotifyAction, SpotifyPage},
+    theme,
+    ui::plural_songs,
+};
 
 pub const APP_NAME: &str = "amplo";
 pub const VISUALIZER_BARS: usize = 28;
@@ -42,8 +53,55 @@ const RESTART_AFTER: Duration = Duration::from_secs(3);
 const NO_AUDIO: &str = "No audio files found in that folder.";
 /// Shown while the audio output cannot be opened again, for example right after sleep.
 const NO_OUTPUT: &str = "No audio output";
+/// How long a confirmation stays in the title bar.
+const NOTICE_SECONDS: f64 = 3.0;
+/// How long the app waits for the clipboard text after asking for it.
+const PASTE_WAIT: Duration = Duration::from_secs(1);
 /// How often a lost audio output is opened again until a device answers.
 const REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The message with its causes, which rodio leaves out of its own text.
+fn error_chain(err: &dyn std::error::Error) -> String {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(": ");
+        text.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    text
+}
+
+/// How a click changes the selected rows, as in a file manager.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    /// Only this row. A right click on a row outside the selection does this.
+    Only,
+    /// Ctrl+click adds the row, or takes it out.
+    Toggle,
+    /// Shift+click selects every shown row from the last clicked one to this one.
+    Range,
+}
+
+/// The form that names a new playlist, while it is open.
+#[derive(Default)]
+pub struct NewPlaylist {
+    pub name: String,
+    /// Songs the playlist starts with.
+    pub songs: Vec<PathBuf>,
+    pub error: Option<String>,
+    /// The text box takes the keyboard when the form opens, and again after an error.
+    pub wants_focus: bool,
+}
+
+/// The form that writes or changes the lyrics of a song, while it is open.
+pub struct LyricsEditor {
+    pub track: PathBuf,
+    pub title: String,
+    pub text: String,
+    pub error: Option<String>,
+    pub wants_focus: bool,
+}
 
 pub struct Queue {
     /// `None` once a rescan finds that the playlist no longer exists.
@@ -79,6 +137,28 @@ pub enum Action {
     ToggleFull,
     /// The close button. The window hides in the notification area and the music keeps playing.
     HideToTray,
+    /// Opens the form that names a new playlist.
+    NewPlaylist,
+    /// Opens the same form, for a playlist that starts with the selected songs.
+    NewPlaylistFromSelection,
+    /// Saves the playlist named in the form.
+    CreatePlaylist,
+    /// Changes which rows of the shown playlist are selected.
+    Select(usize, Selection),
+    SelectAll,
+    ClearSelection,
+    /// Appends the selected songs to the playlist at this index.
+    AddToPlaylist(usize),
+    /// Takes the selected songs out of the shown playlist.
+    RemoveFromPlaylist,
+    /// Saves the text on the clipboard as the lyrics of the song that plays.
+    PasteLyrics,
+    /// Opens the form that writes or changes the lyrics of the song that plays.
+    EditLyrics,
+    SaveLyrics,
+    CloseLyricsEditor,
+    /// Shows the next of nothing, romaji, and translation under each lyric line.
+    CycleLyricsExtra,
     Expand,
     Minimize,
     ToggleLike,
@@ -87,6 +167,7 @@ pub enum Action {
     OpenFolder,
     Seek(f32),
     SaveSettings,
+    Spotify(SpotifyAction),
 }
 
 /// What a finished library scan is for.
@@ -162,6 +243,24 @@ pub struct App {
     pub full: bool,
     /// The search box of the full layout. It filters the shown playlist.
     pub search: String,
+    pub new_playlist: Option<NewPlaylist>,
+    /// A playlist just created, which opens once the rescan finds it.
+    open_when_found: Option<String>,
+    /// Selected rows of the shown playlist, by their position in it.
+    pub selected: BTreeSet<usize>,
+    /// Where the next Shift+click range starts.
+    select_anchor: Option<usize>,
+    /// A short confirmation, such as songs added to a playlist, and when it goes away.
+    pub notice: Option<(String, f64)>,
+    pub lyrics_editor: Option<LyricsEditor>,
+    /// Until then, a paste from the clipboard becomes the lyrics of the song that plays.
+    pub paste_lyrics_until: Option<Instant>,
+    pub spotify: SpotifyPage,
+    /// True while the full layout shows the Spotify page in place of a playlist.
+    pub spotify_open: bool,
+    /// Counts changes to the library's songs and tags, so work that depends on them knows
+    /// when to start again.
+    pub library_revision: u64,
     window_title: String,
     /// Media keys and the Windows media panel. Missing in tests, which have no window.
     #[cfg(windows)]
@@ -247,6 +346,7 @@ impl App {
         let (events, scan_events) = mpsc::channel();
         let covers = Covers::new(&ctx);
         let saved_folder = settings.folder.clone();
+        let spotify = SpotifyPage::new(&ctx, settings.spotify_client.as_deref(), settings.spotify_token.as_deref());
         let mut app = Self {
             ctx,
             library: Library::default(),
@@ -284,6 +384,16 @@ impl App {
             marquee_started: 0.0,
             full: false,
             search: String::new(),
+            new_playlist: None,
+            open_when_found: None,
+            selected: BTreeSet::new(),
+            select_anchor: None,
+            notice: None,
+            lyrics_editor: None,
+            paste_lyrics_until: None,
+            spotify,
+            spotify_open: false,
+            library_revision: 0,
             window_title: APP_NAME.to_owned(),
             #[cfg(windows)]
             media: None,
@@ -348,6 +458,7 @@ impl App {
         while let Ok(event) = self.scan_events.try_recv() {
             match event {
                 ScanEvent::Loaded { generation, library, kind } if generation == self.generation => {
+                    self.library_revision += 1;
                     self.loading = false;
                     match kind {
                         LoadKind::Open { autoplay, roots, folder } => {
@@ -360,6 +471,7 @@ impl App {
                 ScanEvent::Info { generation, track, info } if generation == self.generation => {
                     if let Some(entry) = self.library.tracks.get_mut(track) {
                         entry.info = info;
+                        self.library_revision += 1;
                     }
                 }
                 ScanEvent::Finished { generation } if generation == self.generation => self.scanning = false,
@@ -455,9 +567,138 @@ impl App {
         } else {
             self.queue = queue;
         }
+        if view != self.view || self.library.playlists.get(view).map(|p| &p.tracks) != library.playlists.get(view).map(|p| &p.tracks) {
+            // The rows moved, so the selection would point at other songs.
+            self.selected.clear();
+            self.select_anchor = None;
+        }
         self.view = view;
         self.library = library;
         self.scanning = true;
+        if let Some(name) = self.open_when_found.take() {
+            match self.library.playlists.iter().position(|playlist| playlist.name == name) {
+                Some(index) => {
+                    self.view = index;
+                    self.minimized = true;
+                }
+                // The file is there, so a later rescan finds it.
+                None => self.open_when_found = Some(name),
+            }
+        }
+    }
+
+    fn select(&mut self, row: usize, how: Selection) {
+        match how {
+            Selection::Only => {
+                self.selected = BTreeSet::from([row]);
+                self.select_anchor = Some(row);
+            }
+            Selection::Toggle => {
+                if !self.selected.remove(&row) {
+                    self.selected.insert(row);
+                }
+                self.select_anchor = Some(row);
+            }
+            Selection::Range => {
+                // The range follows the shown order, which a search can shorten.
+                let rows = self.visible_rows();
+                let anchor = self.select_anchor.unwrap_or(row);
+                let (Some(from), Some(to)) =
+                    (rows.iter().position(|&r| r == anchor), rows.iter().position(|&r| r == row))
+                else {
+                    self.selected = BTreeSet::from([row]);
+                    self.select_anchor = Some(row);
+                    return;
+                };
+                self.selected = rows[from.min(to)..=from.max(to)].iter().copied().collect();
+            }
+        }
+    }
+
+    /// The selected songs in playlist order.
+    fn selected_songs(&self) -> Vec<PathBuf> {
+        let Some(playlist) = self.library.playlists.get(self.view) else { return Vec::new() };
+        self.selected
+            .iter()
+            .filter_map(|&row| playlist.tracks.get(row))
+            .map(|&track| self.library.tracks[track].path.clone())
+            .collect()
+    }
+
+    /// Shows a short confirmation in the title bar for a few seconds.
+    fn notify(&mut self, text: String) {
+        let until = self.ctx.input(|input| input.time) + NOTICE_SECONDS;
+        self.notice = Some((text, until));
+        self.ctx.request_repaint_after_secs(NOTICE_SECONDS as f32);
+    }
+
+    fn add_to_playlist(&mut self, index: usize) {
+        let songs = self.selected_songs();
+        let Some(playlist) = self.library.playlists.get(index) else { return };
+        let Some(path) = playlist.path.clone() else { return };
+        let name = playlist.name.clone();
+        match library::add_to_playlist(&path, &songs) {
+            Ok(0) if songs.len() == 1 => self.notify(format!("Already in {name}.")),
+            Ok(0) => self.notify(format!("These songs are already in {name}.")),
+            Ok(added) => {
+                let skipped = songs.len() - added;
+                let text = if skipped == 0 {
+                    format!("Added {} to {name}.", plural_songs(added))
+                } else {
+                    format!("Added {} to {name}. Skipped {} already in it.", plural_songs(added), plural_songs(skipped))
+                };
+                self.notify(text);
+                self.load_library(self.roots.clone(), LoadKind::Refresh);
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    /// Writes the playlist file into the music folder, and rescans so it shows.
+    fn create_playlist(&mut self) {
+        let Some(form) = &mut self.new_playlist else { return };
+        let Some(folder) = self.roots.iter().find(|root| root.is_dir()) else {
+            form.error = Some("Open a music folder first.".to_owned());
+            return;
+        };
+        match library::create_playlist(folder, &form.name, &form.songs) {
+            Ok(name) => {
+                self.new_playlist = None;
+                self.open_when_found = Some(name);
+                self.load_library(self.roots.clone(), LoadKind::Refresh);
+            }
+            Err(err) => {
+                form.error = Some(err);
+                form.wants_focus = true;
+            }
+        }
+    }
+
+    /// Saves songs found for a Spotify playlist as a playlist file in the music folder. A taken
+    /// name gets a number. `missing` counts the songs that were not found.
+    pub fn import_playlist(&mut self, name: &str, songs: &[PathBuf], missing: usize) {
+        if songs.is_empty() {
+            self.notify("None of these songs are in your music folder yet.".to_owned());
+            return;
+        }
+        let Some(folder) = self.roots.iter().find(|root| root.is_dir()) else {
+            self.error = Some("Open a music folder first.".to_owned());
+            return;
+        };
+        let taken: Vec<String> = self.library.playlists.iter().map(|playlist| playlist.name.clone()).collect();
+        match library::create_numbered_playlist(folder, name, songs, &taken) {
+            Ok(created) => {
+                let imported = format!("Imported {} as “{created}”.", plural_songs(songs.len()));
+                let text = if missing == 0 {
+                    imported
+                } else {
+                    format!("{imported} Left out {} not in your folder.", plural_songs(missing))
+                };
+                self.notify(text);
+                self.load_library(self.roots.clone(), LoadKind::Refresh);
+            }
+            Err(err) => self.error = Some(err),
+        }
     }
 
     fn install_library(&mut self, library: Library, autoplay: bool, roots: Vec<PathBuf>, folder: Option<PathBuf>) {
@@ -583,17 +824,35 @@ impl App {
 
     /// Opens the default output device. Its errors mark the output as lost, and the next
     /// update opens it again. See [`App::recover_audio`].
+    ///
+    /// The default device follows Windows when it switches devices. If it fails to open, the
+    /// device that is the default right now is opened directly. Other devices are never
+    /// tried, because they can be silent ones, such as Steam Streaming Speakers. A speaker in
+    /// a monitor is missing for a moment after sleep, and the next try finds it again.
     fn open_sink(&self) -> Result<MixerDeviceSink, String> {
         let lost = Arc::clone(&self.audio_lost);
         let ctx = self.ctx.clone();
-        let mut sink = DeviceSinkBuilder::from_default_device()
-            .map_err(|err| err.to_string())?
-            .with_error_callback(move |_| {
-                lost.store(true, Ordering::Relaxed);
-                ctx.request_repaint();
-            })
-            .open_sink_or_fallback()
-            .map_err(|err| err.to_string())?;
+        let on_error = move |_: cpal::Error| {
+            lost.store(true, Ordering::Relaxed);
+            ctx.request_repaint();
+        };
+        let open = |builder: Result<DeviceSinkBuilder, DeviceSinkError>| {
+            builder.and_then(|builder| builder.with_error_callback(on_error.clone()).open_sink_or_fallback())
+        };
+
+        let mut sink = match open(DeviceSinkBuilder::from_default_device()) {
+            Ok(sink) => sink,
+            Err(err) => {
+                let host = cpal::default_host();
+                let default_id = host.default_output_device().and_then(|device| device.id().ok());
+                let device = default_id.and_then(|id| {
+                    host.output_devices().ok()?.find(|device| device.id().ok().as_ref() == Some(&id))
+                });
+                device
+                    .and_then(|device| open(DeviceSinkBuilder::from_device(device)).ok())
+                    .ok_or_else(|| error_chain(&err))?
+            }
+        };
         sink.log_on_drop(false);
         Ok(sink)
     }
@@ -693,6 +952,98 @@ impl App {
         }
     }
 
+    /// What can show under the lines of the current lyrics, starting with nothing.
+    pub fn lyric_extra_choices(&self) -> Vec<Option<Extra>> {
+        let mut choices = vec![None];
+        if let Some(lyrics) = &self.lyrics {
+            choices.extend([Extra::Romaji, Extra::Translation].into_iter().filter(|&extra| lyrics.has(extra)).map(Some));
+        }
+        choices
+    }
+
+    /// What shows under each lyric line: the chosen kind, when these lyrics have it.
+    pub fn lyric_extra(&self) -> Option<Extra> {
+        self.settings.lyrics_extra.filter(|&extra| self.lyrics.as_ref().is_some_and(|lyrics| lyrics.has(extra)))
+    }
+
+    /// Saves `text` as the `.lrc` file beside the song that plays, and shows it at once.
+    fn write_lyrics(&mut self, text: &str) -> Result<String, String> {
+        let track = self.current_track().ok_or("Play a song first, then add its lyrics.")?;
+        let lyrics = Lyrics::parse(text).ok_or("These lyrics have no lines.")?;
+        let path = self.library.tracks[track].path.clone();
+        let mut text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n").replace('\n', "\r\n");
+        if !text.ends_with("\r\n") {
+            text.push_str("\r\n");
+        }
+        fs::write(path.with_extension("lrc"), text).map_err(|err| format!("Could not save the lyrics: {err}"))?;
+        self.lyrics = Some(lyrics);
+        self.lyric_motion = LyricMotion::default();
+        Ok(self.library.tracks[track].info.title.clone())
+    }
+
+    /// Lyrics pasted from the clipboard, or dropped on the window as a file.
+    pub fn add_lyrics(&mut self, text: &str) {
+        match self.write_lyrics(text) {
+            Ok(title) => self.notify(format!("Saved the lyrics of {title}.")),
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    fn edit_lyrics(&mut self) {
+        let Some(track) = self.current_track() else { return };
+        let track = &self.library.tracks[track];
+        let bytes = fs::read(track.path.with_extension("lrc")).unwrap_or_default();
+        let text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').replace("\r\n", "\n");
+        self.lyrics_editor = Some(LyricsEditor {
+            track: track.path.clone(),
+            title: track.info.title.clone(),
+            text,
+            error: None,
+            wants_focus: true,
+        });
+    }
+
+    fn save_lyrics(&mut self) {
+        let Some(editor) = self.lyrics_editor.take() else { return };
+        // The song may have changed while the form was open.
+        if !self.current_track().is_some_and(|track| self.library.tracks[track].path == editor.track) {
+            self.lyrics_editor = Some(LyricsEditor { error: Some("This song stopped playing.".to_owned()), ..editor });
+            return;
+        }
+        match self.write_lyrics(&editor.text) {
+            Ok(title) => self.notify(format!("Saved the lyrics of {title}.")),
+            Err(err) => self.lyrics_editor = Some(LyricsEditor { error: Some(err), wants_focus: true, ..editor }),
+        }
+    }
+
+    /// Takes the selected songs out of the shown playlist. The song files stay.
+    fn remove_from_playlist(&mut self) {
+        let songs = self.selected_songs();
+        let Some(playlist) = self.library.playlists.get(self.view) else { return };
+        let name = playlist.name.clone();
+        let count = plural_songs(songs.len());
+        if self.view == LIKED_SONGS {
+            for song in &songs {
+                self.settings.liked.remove(song);
+            }
+            self.library.refresh_liked(&self.settings.liked);
+            if self.library.playlists[LIKED_SONGS].tracks.is_empty() {
+                self.view = ALL_SONGS;
+            }
+            self.save_settings();
+        } else {
+            let Some(path) = playlist.path.clone() else { return };
+            if let Err(err) = library::remove_from_playlist(&path, &songs) {
+                self.error = Some(err);
+                return;
+            }
+            self.load_library(self.roots.clone(), LoadKind::Refresh);
+        }
+        self.selected.clear();
+        self.select_anchor = None;
+        self.notify(format!("Removed {count} from {name}."));
+    }
+
     fn toggle_like(&mut self) {
         let Some(track) = self.current_track() else { return };
         let path = self.library.tracks[track].path.clone();
@@ -720,6 +1071,8 @@ impl App {
             Action::Next => self.next(),
             Action::Previous => self.previous(),
             Action::PlayRow(row) => {
+                self.selected.clear();
+                self.select_anchor = Some(row);
                 self.play_view(Some(row));
                 // A chosen song opens Now Playing, where it shows.
                 if self.current_track().is_some() {
@@ -735,8 +1088,13 @@ impl App {
             Action::PlayQueue(position) => self.play_at(position),
             Action::ShowCardTab(tab) => self.card_tab = tab,
             Action::OpenPlaylist(index) => {
+                if index != self.view {
+                    self.selected.clear();
+                    self.select_anchor = None;
+                }
                 self.view = index;
                 self.minimized = true;
+                self.spotify_open = false;
             }
             Action::Expand => {
                 self.minimized = false;
@@ -745,12 +1103,45 @@ impl App {
             Action::Minimize => self.minimized = true,
             Action::ToggleFull => self.ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!self.full)),
             Action::HideToTray => self.hide_to_tray(),
+            Action::NewPlaylist => {
+                self.new_playlist = Some(NewPlaylist { wants_focus: true, ..NewPlaylist::default() });
+            }
+            Action::NewPlaylistFromSelection => {
+                let songs = self.selected_songs();
+                self.new_playlist = Some(NewPlaylist { songs, wants_focus: true, ..NewPlaylist::default() });
+            }
+            Action::CreatePlaylist => self.create_playlist(),
+            Action::Select(row, how) => self.select(row, how),
+            Action::SelectAll => {
+                self.selected = self.visible_rows().into_iter().collect();
+                self.select_anchor = None;
+            }
+            Action::ClearSelection => {
+                self.selected.clear();
+                self.select_anchor = None;
+            }
+            Action::AddToPlaylist(index) => self.add_to_playlist(index),
+            Action::RemoveFromPlaylist => self.remove_from_playlist(),
+            Action::PasteLyrics => {
+                self.ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                self.paste_lyrics_until = Some(Instant::now() + PASTE_WAIT);
+            }
+            Action::EditLyrics => self.edit_lyrics(),
+            Action::SaveLyrics => self.save_lyrics(),
+            Action::CloseLyricsEditor => self.lyrics_editor = None,
+            Action::CycleLyricsExtra => {
+                let choices = self.lyric_extra_choices();
+                let current = choices.iter().position(|&choice| choice == self.lyric_extra()).unwrap_or(0);
+                self.settings.lyrics_extra = choices[(current + 1) % choices.len()];
+                self.save_settings();
+            }
             Action::ToggleLike => self.toggle_like(),
             Action::ToggleShuffle => self.toggle_shuffle(),
             Action::ToggleRepeat => self.repeat = !self.repeat,
             Action::OpenFolder => self.open_folder(),
             Action::Seek(seconds) => self.seek(seconds),
             Action::SaveSettings => self.save_settings(),
+            Action::Spotify(action) => self.spotify_action(action),
         }
     }
 
@@ -769,7 +1160,8 @@ impl App {
     /// The icon stays in the notification area for as long as the app runs, as Spotify's does.
     #[cfg(windows)]
     pub fn attach_tray(&mut self, window: windows::Win32::Foundation::HWND) {
-        self.tray = Tray::new(window);
+        let ctx = self.ctx.clone();
+        self.tray = Tray::new(window, move || ctx.request_repaint());
         if let Some(tray) = &mut self.tray {
             tray.show_icon();
         }
@@ -883,6 +1275,7 @@ impl App {
     pub fn update_playback(&mut self, ctx: &egui::Context) {
         self.receive_scan_events();
         self.covers.poll(ctx);
+        self.poll_spotify(ctx);
         self.recover_audio(ctx);
         if self.player.as_ref().is_some_and(Player::empty) {
             self.advance();

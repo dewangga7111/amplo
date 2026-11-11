@@ -10,8 +10,12 @@ use amplo::library::{LIKED_SONGS, Playlist};
 use crate::{
     app::{Action, App, CardTab, format_time},
     covers::LargeCover,
+    spotify_page::SpotifyAction,
     theme,
-    ui::{LyricStyle, UNKNOWN_TIME, artist_name, plural_songs, title_bar_drag},
+    ui::{
+        LyricStyle, UNKNOWN_TIME, artist_name, draw_empty_playlist, paint_empty_cover, plural_songs,
+        title_bar_drag,
+    },
     widgets::{
         IconButton, MarqueeText, accent_button, at, click_area, line, marquee, paint_equalizer, paint_icon,
         paint_shadow, paint_text, paint_texture, paint_two_lines, pill_button, spaced_line,
@@ -133,14 +137,19 @@ impl App {
         let field = Rect::from_min_size(pos2(field_left, center_y - 18.0), vec2(field_width, 36.0));
         self.draw_search(ui, field, actions);
 
-        if let Some(error) = &self.error {
+        let message = match (&self.error, &self.notice) {
+            (Some(error), _) => Some((error, theme::WARNING)),
+            (None, Some((notice, _))) => Some((notice, theme::ACCENT)),
+            (None, None) => None,
+        };
+        if let Some((message, color)) = message {
             let left = field.right() + 16.0;
             let width = (minimize.left() - 16.0 - left).max(0.0);
-            let galley = line(ui, error, theme::inter(12.0), theme::WARNING, width);
+            let galley = line(ui, message, theme::inter(12.0), color, width);
             let text = Align2::LEFT_CENTER.anchor_size(pos2(left, center_y), galley.size());
             paint_text(ui, Align2::LEFT_CENTER, pos2(left, center_y), galley);
             // A long message is cut short, so it needs another way to be read in full.
-            ui.interact(text, ui.scope_id().with("error"), Sense::hover()).on_hover_text(error);
+            ui.interact(text, ui.scope_id().with("error"), Sense::hover()).on_hover_text(message);
         }
     }
 
@@ -162,8 +171,13 @@ impl App {
             .desired_width(text.width());
         let response = ui.put(text, edit);
         // The results show in the song list, which Now Playing covers.
-        if response.changed() && !self.search.trim().is_empty() {
-            actions.push(Action::Minimize);
+        if response.changed() {
+            // Other rows show now, and the selection could hold hidden ones.
+            actions.push(Action::ClearSelection);
+            if !self.search.trim().is_empty() {
+                actions.push(Action::Minimize);
+                self.spotify_open = false;
+            }
         }
         if response.lost_focus() && ui.input(|input| input.key_pressed(Key::Escape)) {
             self.search.clear();
@@ -194,19 +208,27 @@ impl App {
         if self.nav_item(ui, now_rect, theme::DISC, "Now Playing", None, has_track && !self.minimized, has_track) {
             actions.push(Action::Expand);
         }
-        let liked_rect = now_rect.translate(vec2(0.0, NAV_ITEM + 2.0));
+        let spotify_rect = now_rect.translate(vec2(0.0, NAV_ITEM + 2.0));
+        if self.nav_item(ui, spotify_rect, theme::CLOUD, "Spotify", None, self.minimized && self.spotify_open, true) {
+            actions.push(Action::Spotify(SpotifyAction::Open));
+        }
+        let liked_rect = spotify_rect.translate(vec2(0.0, NAV_ITEM + 2.0));
         let liked = self.library.playlists.get(LIKED_SONGS).map_or(0, |playlist| playlist.tracks.len());
-        let liked_active = self.minimized && self.view == LIKED_SONGS;
+        let liked_active = self.minimized && !self.spotify_open && self.view == LIKED_SONGS;
         if self.nav_item(ui, liked_rect, theme::HEART, "Liked Songs", Some(liked), liked_active, liked > 0) {
             actions.push(Action::OpenPlaylist(LIKED_SONGS));
         }
 
         let playlists_top = liked_rect.bottom() + 24.0;
         heading(ui, "PLAYLISTS", playlists_top + 14.0);
-        let open = Rect::from_min_size(pos2(left + width - 4.0 - 28.0, playlists_top), Vec2::splat(28.0));
-        let plus = IconButton { icon: theme::PLUS, icon_size: 16.0, color: theme::SOFT, radius: 8.0 };
-        if plus.show(ui, open, "Open music folder").clicked() {
+        let add = Rect::from_min_size(pos2(left + width - 4.0 - 28.0, playlists_top), Vec2::splat(28.0));
+        let open = add.translate(vec2(-32.0, 0.0));
+        let button = |icon| IconButton { icon, icon_size: 16.0, color: theme::SOFT, radius: 8.0 };
+        if button(theme::FOLDER).show(ui, open, "Open music folder").clicked() {
             actions.push(Action::OpenFolder);
+        }
+        if button(theme::PLUS).show(ui, add, "New playlist").clicked() {
+            actions.push(Action::NewPlaylist);
         }
 
         let list = Rect::from_min_max(pos2(left, playlists_top + 36.0), pos2(left + width, rect.bottom() - 14.0));
@@ -267,7 +289,7 @@ impl App {
     }
 
     fn draw_full_playlist_item(&mut self, ui: &mut Ui, rect: Rect, index: usize, actions: &mut Vec<Action>) {
-        let active = self.minimized && self.view == index;
+        let active = self.minimized && !self.spotify_open && self.view == index;
         let is_playing = self.is_playing() && self.queue.as_ref().is_some_and(|queue| queue.playlist == Some(index));
         let playlist = self.library.playlists[index].clone();
         let response = click_area(ui, rect, &playlist.name);
@@ -282,9 +304,12 @@ impl App {
 
         let center_y = rect.center().y;
         let cover = Rect::from_center_size(pos2(rect.left() + 29.0, center_y), Vec2::splat(38.0));
-        if let Some(&track) = playlist.tracks.first() {
-            let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
-            paint_texture(ui, cover, texture, 8);
+        match playlist.tracks.first() {
+            Some(&track) => {
+                let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
+                paint_texture(ui, cover, texture, 8);
+            }
+            None => paint_empty_cover(ui, cover, 8.0),
         }
 
         let text_left = cover.right() + 12.0;
@@ -306,8 +331,12 @@ impl App {
             self.draw_empty_state(ui, stage, actions);
             return;
         };
-        if self.library.tracks.is_empty() || playlist.tracks.is_empty() {
+        if self.library.tracks.is_empty() {
             self.draw_empty_state(ui, stage, actions);
+            return;
+        }
+        if playlist.tracks.is_empty() {
+            draw_empty_playlist(ui, stage, &playlist.name);
             return;
         }
 
@@ -399,14 +428,14 @@ impl App {
         let number = row + 1;
         let title = self.library.tracks[track].info.title.clone();
         let response = click_area(ui, rect, &format!("{number}. {title}"));
-        if is_current {
+        if self.selected.contains(&row) {
+            ui.painter().rect_filled(rect, 12.0, theme::ROW_SELECTED);
+        } else if is_current {
             ui.painter().rect_filled(rect, 12.0, theme::ROW_CURRENT);
         } else if response.hovered() {
             ui.painter().rect_filled(rect, 12.0, theme::FULL_ROW_HOVER);
         }
-        if response.clicked() {
-            actions.push(Action::PlayRow(row));
-        }
+        self.song_row_input(ui, &response, row, actions);
         self.paint_full_track(ui, rect, number, track, is_current);
     }
 
@@ -586,15 +615,20 @@ impl App {
         let header_bottom = inner.top() + 24.0;
         match self.card_tab {
             CardTab::Lyrics => {
+                let mut edit_right = inner.right();
                 if self.lyrics.as_ref().is_some_and(|lyrics| lyrics.synced) {
                     let badge = spaced_line(ui, "SYNCED", theme::inter_semibold(11.0), theme::ACCENT, 100.0, 0.66);
                     let size = badge.size() + vec2(20.0, 8.0);
                     let pill = Rect::from_min_size(pos2(inner.right() - size.x, inner.top()), size);
                     ui.painter().rect_stroke(pill, size.y / 2.0, Stroke::new(1.0, theme::PILL_LINE), egui::StrokeKind::Inside);
                     paint_text(ui, Align2::CENTER_CENTER, pill.center(), badge);
+                    edit_right = pill.left() - 16.0;
+                }
+                if self.lyrics.is_some() {
+                    self.draw_lyrics_links(ui, edit_right, inner.top() + 11.0, theme::inter_semibold(13.0), false, actions);
                 }
                 let view = Rect::from_min_max(pos2(inner.left(), header_bottom + 12.0), inner.max);
-                self.draw_lyrics(ui, view, dt, &FULL_LYRICS);
+                self.draw_lyrics(ui, view, dt, &FULL_LYRICS, actions);
             }
             CardTab::Queue => {
                 // The lyrics do not animate while hidden, so nothing is left to wait for.

@@ -2,16 +2,31 @@
 
 use std::{collections::BTreeSet, fmt::Write as _, fs, io, path::PathBuf};
 
+use crate::lyrics::Extra;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     pub folder: Option<PathBuf>,
     pub volume: f32,
     pub liked: BTreeSet<PathBuf>,
+    /// The Client ID of the user's own app on the Spotify dashboard.
+    pub spotify_client: Option<String>,
+    /// Keeps the user logged in to Spotify between runs.
+    pub spotify_token: Option<String>,
+    /// What shows under each lyric line when the lyrics file has it. `None` shows nothing.
+    pub lyrics_extra: Option<Extra>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { folder: None, volume: 0.7, liked: BTreeSet::new() }
+        Self {
+            folder: None,
+            volume: 0.7,
+            liked: BTreeSet::new(),
+            spotify_client: None,
+            spotify_token: None,
+            lyrics_extra: Some(Extra::Romaji),
+        }
     }
 }
 
@@ -35,6 +50,11 @@ impl Settings {
                 Some(("liked", value)) if !value.is_empty() => {
                     settings.liked.insert(PathBuf::from(value));
                 }
+                Some(("spotify_client", value)) if !value.is_empty() => settings.spotify_client = Some(value.to_owned()),
+                Some(("spotify_token", value)) if !value.is_empty() => settings.spotify_token = Some(value.to_owned()),
+                Some(("lyrics_extra", "romaji")) => settings.lyrics_extra = Some(Extra::Romaji),
+                Some(("lyrics_extra", "translation")) => settings.lyrics_extra = Some(Extra::Translation),
+                Some(("lyrics_extra", "none")) => settings.lyrics_extra = None,
                 _ => {}
             }
         }
@@ -50,6 +70,18 @@ impl Settings {
         for path in &self.liked {
             let _ = writeln!(text, "liked={}", path.display());
         }
+        if let Some(client) = &self.spotify_client {
+            let _ = writeln!(text, "spotify_client={client}");
+        }
+        if let Some(token) = &self.spotify_token {
+            let _ = writeln!(text, "spotify_token={token}");
+        }
+        let extra = match self.lyrics_extra {
+            Some(Extra::Romaji) => "romaji",
+            Some(Extra::Translation) => "translation",
+            None => "none",
+        };
+        let _ = writeln!(text, "lyrics_extra={extra}");
         text
     }
 
@@ -77,7 +109,12 @@ mod tests {
             folder: Some(PathBuf::from("G:\\Music")),
             volume: 0.25,
             liked: BTreeSet::from([PathBuf::from("G:\\Music\\a = b - 光.flac")]),
+            spotify_client: Some("0123abcd".to_owned()),
+            spotify_token: Some("AQ-x_y".to_owned()),
+            lyrics_extra: Some(Extra::Translation),
         };
+        assert_eq!(Settings::parse(&settings.serialize()), settings);
+        let settings = Settings { lyrics_extra: None, ..settings };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
     }
 

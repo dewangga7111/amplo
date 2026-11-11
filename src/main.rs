@@ -5,6 +5,7 @@ mod app;
 mod covers;
 #[cfg(windows)]
 mod media_controls;
+mod spotify_page;
 #[cfg(test)]
 mod tests;
 mod theme;

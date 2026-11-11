@@ -50,6 +50,8 @@ impl Track {
 pub struct Playlist {
     pub name: String,
     pub tracks: Vec<usize>,
+    /// The `.m3u` file. All Songs and Liked Songs have none, so songs cannot be added to them.
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Default)]
@@ -145,6 +147,145 @@ fn playlist_name(path: &Path) -> String {
     if name.is_empty() { stem.into_owned() } else { name.to_owned() }
 }
 
+/// Characters Windows does not allow in a file name.
+const NOT_IN_FILE_NAMES: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*'];
+
+/// How a song is written in a playlist: relative to the playlist's folder when it is inside
+/// it, so the folder can move, and as a full path otherwise.
+fn playlist_entry(base: &Path, track: &Path) -> String {
+    track.strip_prefix(base).unwrap_or(track).to_string_lossy().into_owned()
+}
+
+/// Appends songs to an `.m3u` playlist, and returns how many it gained. Songs it already has
+/// are left out, so adding twice changes nothing.
+pub fn add_to_playlist(playlist: &Path, tracks: &[PathBuf]) -> Result<usize, String> {
+    let failed = |err: std::io::Error| format!("Could not change the playlist: {err}");
+    let bytes = fs::read(playlist).map_err(failed)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let base = playlist.parent().unwrap_or(Path::new(""));
+    let mut known: std::collections::HashSet<String> =
+        parse_m3u(&text, base).iter().map(|entry| path_key(entry)).collect();
+    let newline = if text.contains("\r\n") || text.is_empty() { "\r\n" } else { "\n" };
+
+    let mut added = String::new();
+    let mut count = 0;
+    for track in tracks {
+        if known.insert(path_key(track)) {
+            added.push_str(&playlist_entry(base, track));
+            added.push_str(newline);
+            count += 1;
+        }
+    }
+    if count == 0 {
+        return Ok(0);
+    }
+    let mut start = String::new();
+    if text.is_empty() {
+        start.push_str("#EXTM3U");
+        start.push_str(newline);
+    } else if !text.ends_with('\n') {
+        start.push_str(newline);
+    }
+    let mut file = fs::OpenOptions::new().append(true).open(playlist).map_err(failed)?;
+    std::io::Write::write_all(&mut file, (start + &added).as_bytes()).map_err(failed)?;
+    Ok(count)
+}
+
+/// Takes songs out of an `.m3u` playlist, each `#EXTINF` line about them too, and returns
+/// how many entries went. Everything else in the file stays as it was.
+pub fn remove_from_playlist(playlist: &Path, tracks: &[PathBuf]) -> Result<usize, String> {
+    let failed = |err: std::io::Error| format!("Could not change the playlist: {err}");
+    let bytes = fs::read(playlist).map_err(failed)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let base = playlist.parent().unwrap_or(Path::new(""));
+    let unwanted: std::collections::HashSet<String> = tracks.iter().map(|track| path_key(track)).collect();
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
+
+    let mut kept: Vec<&str> = Vec::new();
+    let mut removed = 0;
+    for line in text.lines() {
+        let entry = line.trim().trim_start_matches('\u{feff}');
+        if !entry.is_empty() && !entry.starts_with('#') && unwanted.contains(&path_key(&base.join(entry))) {
+            removed += 1;
+            // An `#EXTINF` line describes the entry after it.
+            if kept.last().is_some_and(|last| last.trim().to_ascii_uppercase().starts_with("#EXTINF")) {
+                kept.pop();
+            }
+            continue;
+        }
+        kept.push(line);
+    }
+    if removed == 0 {
+        return Ok(0);
+    }
+    let mut new_text = kept.join(newline);
+    if text.ends_with('\n') {
+        new_text.push_str(newline);
+    }
+    fs::write(playlist, new_text).map_err(failed)?;
+    Ok(removed)
+}
+
+/// Writes a new `.m3u` playlist into `folder` with `tracks` in it, and returns the name the
+/// library will show for it. Fails when the name is empty or a playlist file of that name
+/// exists.
+pub fn create_playlist(folder: &Path, name: &str, tracks: &[PathBuf]) -> Result<String, String> {
+    let file_name = file_name_for(name)?;
+    let path = folder.join(format!("{file_name}.m3u"));
+    match write_new_playlist(folder, &path, tracks) {
+        Ok(()) => Ok(playlist_name(&path)),
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(format!("A playlist named “{file_name}” already exists."))
+        }
+        Err(err) => Err(format!("Could not create the playlist: {err}")),
+    }
+}
+
+/// Like [`create_playlist`], but a name that is taken gets a number: `Mix`, then `Mix 2`,
+/// `Mix 3`, and so on. `taken` holds the names of playlists the library already shows, which
+/// can live in other folders.
+pub fn create_numbered_playlist(folder: &Path, name: &str, tracks: &[PathBuf], taken: &[String]) -> Result<String, String> {
+    let file_name = file_name_for(name)?;
+    let taken: std::collections::HashSet<String> = taken.iter().map(|name| name.to_lowercase()).collect();
+    for number in 1..1000 {
+        let candidate = if number == 1 { file_name.clone() } else { format!("{file_name} {number}") };
+        let path = folder.join(format!("{candidate}.m3u"));
+        let shown = playlist_name(&path);
+        if taken.contains(&shown.to_lowercase()) || path.with_extension("m3u8").exists() {
+            continue;
+        }
+        match write_new_playlist(folder, &path, tracks) {
+            Ok(()) => return Ok(shown),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(err) => return Err(format!("Could not create the playlist: {err}")),
+        }
+    }
+    Err(format!("Too many playlists are named “{file_name}”."))
+}
+
+/// The name as Windows allows it in a file name.
+fn file_name_for(name: &str) -> Result<String, String> {
+    let allowed: String = name.chars().filter(|c| !c.is_control() && !NOT_IN_FILE_NAMES.contains(c)).collect();
+    let file_name = allowed.split_whitespace().collect::<Vec<_>>().join(" ");
+    // Windows drops dots and spaces at the end of a file name.
+    let file_name = file_name.trim_end_matches('.').trim_end();
+    if file_name.is_empty() {
+        return Err("Type a name for the playlist.".to_owned());
+    }
+    Ok(file_name.to_owned())
+}
+
+/// Fails with `AlreadyExists` when a file is at `path`, and then leaves it alone.
+fn write_new_playlist(folder: &Path, path: &Path, tracks: &[PathBuf]) -> std::io::Result<()> {
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+    let mut text = "#EXTM3U\r\n".to_owned();
+    for track in tracks {
+        text.push_str(&playlist_entry(folder, track));
+        text.push_str("\r\n");
+    }
+    std::io::Write::write_all(&mut file, text.as_bytes())
+}
+
 /// Loads a folder, or any mix of folders and files. Tags are read later, because reading
 /// them takes too long for the UI thread. See [`read_info`].
 pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>) -> Library {
@@ -155,8 +296,8 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
 
     let mut library = Library {
         playlists: vec![
-            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect() },
-            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new() },
+            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None },
+            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None },
         ],
         tracks,
         missing_entries: 0,
@@ -177,8 +318,9 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
         let entries = parse_m3u(&String::from_utf8_lossy(&bytes), base);
         let found: Vec<usize> = entries.iter().filter_map(|entry| by_path.get(&path_key(entry)).copied()).collect();
         library.missing_entries += entries.len() - found.len();
-        if !found.is_empty() {
-            library.playlists.push(Playlist { name: playlist_name(&file), tracks: found });
+        // A new playlist has no songs yet. One whose songs are all missing stays hidden.
+        if entries.is_empty() || !found.is_empty() {
+            library.playlists.push(Playlist { name: playlist_name(&file), tracks: found, path: Some(file) });
         }
     }
     library
@@ -238,10 +380,94 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
 
         let names: Vec<&str> = library.playlists.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["All Songs", "Liked Songs", "Mix"]);
+        assert_eq!(names, ["All Songs", "Liked Songs", "Empty", "Mix"], "an empty playlist shows, a missing one does not");
         assert_eq!(library.playlists[ALL_SONGS].tracks.len(), 2);
         assert_eq!(library.tracks[library.playlists[LIKED_SONGS].tracks[0]].info.title, "b");
-        assert_eq!(library.tracks[library.playlists[2].tracks[0]].info.artist, "X");
+        assert!(library.playlists[2].tracks.is_empty());
+        assert_eq!(library.tracks[library.playlists[3].tracks[0]].info.artist, "X");
         assert_eq!(library.missing_entries, 1);
+    }
+
+    #[test]
+    fn creates_an_empty_playlist_file_once() {
+        let root = std::env::temp_dir().join(format!("amplo-new-playlist-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let created = create_playlist(&root, "  Road / Trip?  ", &[]);
+        let again = create_playlist(&root, "road trip", &[]);
+        let blank = create_playlist(&root, " ?* ", &[]);
+        let text = fs::read_to_string(root.join("Road Trip.m3u"));
+        let with_songs = create_playlist(&root, "Mix", &[root.join("sub").join("a.flac"), PathBuf::from("Z:\\b.mp3")]);
+        let mix = fs::read_to_string(root.join("Mix.m3u"));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(created.unwrap(), "Road Trip", "characters Windows refuses are left out");
+        assert_eq!(text.unwrap(), "#EXTM3U\r\n");
+        assert!(again.unwrap_err().contains("already exists"), "file names ignore case on Windows");
+        assert!(blank.is_err());
+        assert_eq!(with_songs.unwrap(), "Mix");
+        assert_eq!(mix.unwrap(), "#EXTM3U\r\nsub\\a.flac\r\nZ:\\b.mp3\r\n", "songs outside the folder keep a full path");
+    }
+
+    #[test]
+    fn removes_songs_and_their_details_from_a_playlist() {
+        let root = std::env::temp_dir().join(format!("amplo-remove-from-playlist-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let playlist = root.join("Mix.m3u");
+        let text = "#EXTM3U\r\n#EXTINF:120,A\r\nsub\\a.flac\r\n#EXTINF:90,B\r\nb.mp3\r\nSUB/A.FLAC\r\nZ:\\c.mp3\r\n";
+        fs::write(&playlist, text).unwrap();
+        let removed = remove_from_playlist(&playlist, &[root.join("sub").join("a.flac"), PathBuf::from("Z:\\c.mp3")]);
+        let after = fs::read_to_string(&playlist);
+        let none = remove_from_playlist(&playlist, &[root.join("other.mp3")]);
+        let unchanged = fs::read_to_string(&playlist);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(removed.unwrap(), 3, "every entry of the song goes, in any spelling");
+        assert_eq!(after.unwrap(), "#EXTM3U\r\n#EXTINF:90,B\r\nb.mp3\r\n");
+        assert_eq!(none.unwrap(), 0);
+        assert_eq!(unchanged.unwrap(), "#EXTM3U\r\n#EXTINF:90,B\r\nb.mp3\r\n");
+    }
+
+    #[test]
+    fn numbers_a_playlist_name_that_is_taken() {
+        let root = std::env::temp_dir().join(format!("amplo-numbered-playlist-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Daily Drive.m3u"), "#EXTM3U\r\n").unwrap();
+        let taken = ["Daily Drive".to_owned(), "daily drive 2".to_owned()];
+        let song = root.join("a.flac");
+        let first = create_numbered_playlist(&root, "Daily Drive", std::slice::from_ref(&song), &taken);
+        let second = create_numbered_playlist(&root, "Daily Drive", &[], &[]);
+        let fresh = create_numbered_playlist(&root, "Chill?", &[], &taken);
+        let text = fs::read_to_string(root.join("Daily Drive 3.m3u"));
+        let old = fs::read_to_string(root.join("Daily Drive.m3u"));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(first.unwrap(), "Daily Drive 3", "a playlist the library shows counts as taken");
+        assert_eq!(second.unwrap(), "Daily Drive 2", "a file in the folder counts as taken");
+        assert_eq!(fresh.unwrap(), "Chill");
+        assert_eq!(text.unwrap(), "#EXTM3U\r\na.flac\r\n");
+        assert_eq!(old.unwrap(), "#EXTM3U\r\n", "the existing playlist stays as it was");
+    }
+
+    #[test]
+    fn adds_new_songs_to_a_playlist_once() {
+        let root = std::env::temp_dir().join(format!("amplo-add-to-playlist-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let playlist = root.join("Mix.m3u");
+        // Written by another program: LF line endings, a different case, no newline at the end.
+        fs::write(&playlist, "#EXTM3U\nSUB/A.flac").unwrap();
+        let songs = [root.join("sub").join("a.flac"), root.join("b.flac"), root.join("b.flac")];
+        let added = add_to_playlist(&playlist, &songs);
+        let again = add_to_playlist(&playlist, &songs);
+        let text = fs::read_to_string(&playlist);
+        fs::write(&playlist, "").unwrap();
+        let into_empty = add_to_playlist(&playlist, &songs[1..2]);
+        let empty_text = fs::read_to_string(&playlist);
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(added.unwrap(), 1, "a.flac was there, and b.flac counts once");
+        assert_eq!(again.unwrap(), 0);
+        assert_eq!(text.unwrap(), "#EXTM3U\nSUB/A.flac\nb.flac\n", "keeps the file's line endings");
+        assert_eq!(into_empty.unwrap(), 1);
+        assert_eq!(empty_text.unwrap(), "#EXTM3U\r\nb.flac\r\n");
     }
 }

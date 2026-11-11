@@ -10,10 +10,15 @@ use std::{
 
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::{Harness, kittest::Queryable};
-use amplo::{library::ALL_SONGS, lyrics::Lyrics, settings::Settings};
+use amplo::{
+    library::ALL_SONGS,
+    lyrics::{Extra, Lyrics},
+    settings::Settings,
+};
 
 use crate::{
     app::{Action, App, CardTab},
+    spotify_page::SpotifyAction,
     ui::WINDOW_SIZE,
 };
 
@@ -63,7 +68,7 @@ impl Drop for TestFolder {
 }
 
 fn silent_settings() -> Settings {
-    Settings { folder: None, volume: 0.0, liked: BTreeSet::new() }
+    Settings { volume: 0.0, ..Settings::default() }
 }
 
 fn wait_until(harness: &mut Harness<'static, App>, what: &str, done: impl Fn(&App) -> bool) {
@@ -635,6 +640,22 @@ fn render_screens() {
     }
     settle(&mut harness, "list");
 
+    harness.state_mut().apply(Action::Select(0, crate::app::Selection::Only));
+    harness.state_mut().apply(Action::Select(2, crate::app::Selection::Range));
+    let third = {
+        let app = harness.state();
+        app.library.tracks[app.library.playlists[app.view].tracks[2]].info.title.clone()
+    };
+    harness.get_by_label(&format!("3. {third}")).click_secondary();
+    harness.run_steps(4);
+    harness.get_by_label("Add 3 songs to playlist").hover();
+    harness.run_steps(4);
+    harness.get_by_label("New playlist…").hover();
+    settle(&mut harness, "list-menu");
+    harness.key_press(egui::Key::Escape);
+    harness.state_mut().apply(Action::ClearSelection);
+    harness.run_steps(2);
+
     let with_lyrics = |app: &App, wanted: bool| {
         app.library.tracks.iter().position(|track| track.path.with_extension("lrc").exists() == wanted)
     };
@@ -669,10 +690,34 @@ fn render_screens() {
         harness.state().player.as_ref().unwrap().try_seek(line.time).unwrap();
         settle(&mut harness, "now-playing-long-lyric");
     }
+    let with_romaji = |app: &App| {
+        app.library.tracks.iter().position(|track| Lyrics::for_track(&track.path).is_some_and(|lyrics| lyrics.has(Extra::Romaji)))
+    };
+    if let Some(row) = with_romaji(harness.state()) {
+        harness.state_mut().apply(Action::PlayRow(row));
+        harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(30)).unwrap();
+        settle(&mut harness, "now-playing-romaji");
+    }
     if let Some(row) = with_lyrics(harness.state(), false) {
         harness.state_mut().apply(Action::PlayRow(row));
         settle(&mut harness, "now-playing-no-lyrics");
+        // Opening the form reads the folder only. Closing it writes nothing.
+        harness.state_mut().apply(Action::EditLyrics);
+        settle(&mut harness, "lyrics-editor");
+        harness.state_mut().apply(Action::CloseLyricsEditor);
     }
+    // Only in memory, so a real music folder gets no new files.
+    harness.state_mut().apply(Action::Minimize);
+    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), path: None };
+    harness.state_mut().library.playlists.push(empty);
+    let empty = harness.state().library.playlists.len() - 1;
+    harness.state_mut().apply(Action::OpenPlaylist(empty));
+    settle(&mut harness, "empty-playlist");
+    harness.state_mut().apply(Action::NewPlaylist);
+    harness.state_mut().new_playlist.as_mut().unwrap().name = "Late Night".to_owned();
+    settle(&mut harness, "new-playlist");
+    harness.state_mut().new_playlist = None;
+    harness.state_mut().library.playlists.pop();
     let playlists = harness.state().library.playlists.len();
     harness.state_mut().apply(Action::OpenPlaylist(playlists - 1));
     settle(&mut harness, "playlist");
@@ -695,9 +740,119 @@ fn render_screens() {
             harness.state_mut().apply(Action::ShowCardTab(CardTab::Lyrics));
             harness.state_mut().apply(Action::Minimize);
         }
+        if let Some(row) = with_romaji(harness.state()) {
+            harness.state_mut().apply(Action::PlayRow(row));
+            harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(30)).unwrap();
+            settle(&mut harness, &format!("full-romaji{suffix}"));
+        }
+        if let Some(row) = with_lyrics(harness.state(), false) {
+            harness.state_mut().apply(Action::PlayRow(row));
+            settle(&mut harness, &format!("full-no-lyrics{suffix}"));
+            harness.state_mut().apply(Action::Minimize);
+        }
     }
+    // Spotify, with songs from the folder and some it lacks. Nothing goes over the network.
+    harness.state_mut().apply(Action::Spotify(SpotifyAction::Open));
+    settle(&mut harness, "full-spotify-login");
+    let sample = |name: &str, artist: &str, album: &str| amplo::spotify::Track {
+        name: name.to_owned(),
+        artists: vec![artist.to_owned()],
+        album: album.to_owned(),
+        image: None,
+        duration_ms: 0,
+    };
+    let mut tracks: Vec<_> = harness
+        .state()
+        .library
+        .tracks
+        .iter()
+        .take(7)
+        .map(|track| sample(&track.info.title, &track.info.artist, &track.info.album))
+        .collect();
+    tracks.insert(2, sample("Midnight City", "M83", "Hurry Up, We're Dreaming"));
+    tracks.push(sample("Dreams", "Fleetwood Mac", "Rumours"));
+    tracks.push(sample("Holocene", "Bon Iver", "Bon Iver"));
+    let playlist = |id: &str, name: &str, tracks: usize, owner: &str| amplo::spotify::Playlist {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        owner: owner.to_owned(),
+        tracks,
+        image: None,
+    };
+    let count = tracks.len();
+    harness.state_mut().spotify.show_sample(vec![
+        (playlist("p1", "Daily Drive", count, "Tester"), tracks),
+        (playlist("p2", "Late Night Lofi", 48, "Tester"), Vec::new()),
+        (playlist("p3", "Road Trip", 112, "A friend"), Vec::new()),
+    ]);
+    settle(&mut harness, "full-spotify");
+    harness.state_mut().apply(Action::Spotify(SpotifyAction::ShowMissingOnly(true)));
+    settle(&mut harness, "full-spotify-missing");
+    harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
+
     harness.state_mut().search = "love".to_owned();
     settle(&mut harness, "full-search");
+}
+
+#[test]
+fn spotify_page_marks_the_songs_the_folder_has() {
+    let folder = TestFolder::new("spotify");
+    let mut harness = harness_for(&folder);
+    harness.set_size(egui::vec2(1280.0, 780.0));
+    harness.state_mut().full = true;
+    harness.run_steps(4);
+
+    click(&mut harness, "Spotify");
+    assert!(harness.state().spotify_open);
+    harness.get_by_label("Log in with Spotify");
+    harness.get_by_label("Copy");
+
+    let playlist = |id: &str, name: &str| amplo::spotify::Playlist {
+        id: id.to_owned(),
+        name: name.to_owned(),
+        owner: "Tester".to_owned(),
+        tracks: 2,
+        image: None,
+    };
+    let track = |name: &str, artist: &str| amplo::spotify::Track {
+        name: name.to_owned(),
+        artists: vec![artist.to_owned()],
+        album: String::new(),
+        image: None,
+        duration_ms: 0,
+    };
+    harness.state_mut().spotify.show_sample(vec![
+        // The folder has a playlist named Mix already.
+        (playlist("p1", "Mix"), vec![track("c long", "Anyone"), track("Not Here", "Nobody")]),
+        (playlist("p2", "Other"), vec![track("a short (Live)", "Someone")]),
+    ]);
+    harness.run_steps(4);
+    let found = |harness: &mut Harness<'static, App>| {
+        let app = harness.state_mut();
+        let tracks = app.library.tracks.clone();
+        let revision = app.library_revision;
+        let matches = app.spotify.matches(&tracks, revision).unwrap();
+        matches.into_iter().map(|found| found.map(|track| tracks[track].info.title.clone())).collect::<Vec<_>>()
+    };
+    assert_eq!(found(&mut harness), [Some("c long".to_owned()), None]);
+    click(&mut harness, "Import as playlist");
+    let imported = fs::read_to_string(folder.0.join("Mix 2.m3u")).unwrap();
+    assert_eq!(imported, "#EXTM3U\r\nc long.wav\r\n", "a taken name gets a number, and missing songs stay out");
+    assert!(harness.state().notice.as_ref().unwrap().0.contains("“Mix 2”"));
+    wait_until(&mut harness, "the rescan", |app| app.library.playlists.iter().any(|playlist| playlist.name == "Mix 2"));
+    assert!(harness.state().spotify_open, "the Spotify page stays open");
+    click(&mut harness, "Other");
+    assert_eq!(harness.state().spotify.open.as_deref(), Some("p2"));
+    assert_eq!(found(&mut harness), [Some("a short".to_owned())], "a version of a song still counts");
+
+    harness.state_mut().settings.spotify_token = Some("saved".to_owned());
+    click(&mut harness, "Log out");
+    assert_eq!(harness.state().settings.spotify_token, None);
+    harness.get_by_label("Log in with Spotify");
+
+    click(&mut harness, "Mix");
+    assert!(!harness.state().spotify_open, "a playlist replaces the Spotify page");
+    harness.get_by_label("1. c long");
 }
 
 #[test]
@@ -803,6 +958,208 @@ fn title_bar_buttons_command_the_window() {
     assert!(commands(&mut harness, "Restore").contains(&egui::ViewportCommand::Maximized(false)));
     let close = commands(&mut harness, "Close");
     assert!(close.contains(&egui::ViewportCommand::Minimized(true)) && !close.contains(&egui::ViewportCommand::Close));
+}
+
+#[test]
+fn new_playlist_writes_a_file_and_opens_it() {
+    let folder = TestFolder::new("new-playlist");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "New playlist");
+    assert!(harness.state().new_playlist.is_some());
+    harness.get_by_role(Role::TextInput).type_text("Road Trip");
+    harness.run_steps(2);
+    harness.key_press(egui::Key::Enter);
+    harness.run_steps(2);
+    assert!(harness.state().new_playlist.is_none(), "Enter saves and closes the form");
+    assert_eq!(fs::read_to_string(folder.0.join("Road Trip.m3u")).unwrap(), "#EXTM3U\r\n");
+
+    wait_until(&mut harness, "the new playlist to open", |app| {
+        app.library.playlists.get(app.view).is_some_and(|playlist| playlist.name == "Road Trip")
+    });
+    assert!(harness.state().library.playlists[harness.state().view].tracks.is_empty());
+    harness.get_by_label("Road Trip");
+    harness.run_steps(4);
+
+    click(&mut harness, "New playlist");
+    harness.get_by_role(Role::TextInput).type_text("mix");
+    harness.run_steps(2);
+    click(&mut harness, "Save");
+    let error = harness.state().new_playlist.as_ref().and_then(|form| form.error.clone());
+    assert!(error.is_some_and(|error| error.contains("already exists")), "a taken name keeps the form open");
+    click(&mut harness, "Cancel");
+    assert!(harness.state().new_playlist.is_none());
+    assert_eq!(fs::read_to_string(folder.0.join("Mix.m3u")).unwrap(), "#EXTM3U\nc long.wav\na short.wav\n");
+}
+
+#[test]
+fn selected_songs_go_into_playlists() {
+    let folder = TestFolder::new("add-to-playlist");
+    let mut harness = harness_for(&folder);
+    harness.get_by_label("1. a short").click_modifiers(egui::Modifiers::COMMAND);
+    harness.run_steps(4);
+    harness.get_by_label("2. b short2").click_modifiers(egui::Modifiers::SHIFT);
+    harness.run_steps(4);
+    assert_eq!(harness.state().selected, BTreeSet::from([0, 1]));
+    assert!(harness.state().player.is_none(), "selecting does not play");
+
+    harness.get_by_label("2. b short2").click_secondary();
+    harness.run_steps(4);
+    harness.get_by_label("Add 2 songs to playlist");
+    let mix = harness.state().library.playlists.iter().position(|playlist| playlist.name == "Mix").unwrap();
+    harness.state_mut().apply(Action::AddToPlaylist(mix));
+    let text = fs::read_to_string(folder.0.join("Mix.m3u")).unwrap();
+    assert_eq!(text, "#EXTM3U\nc long.wav\na short.wav\nb short2.wav\n", "a short was there already");
+    let notice = harness.state().notice.clone().unwrap().0;
+    assert_eq!(notice, "Added 1 song to Mix. Skipped 1 song already in it.");
+    wait_until(&mut harness, "the playlist to grow", |app| app.library.playlists[mix].tracks.len() == 3);
+
+    // The first Escape closes the menu, which the test left open, and the second deselects.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(4);
+    assert_eq!(harness.state().selected.len(), 2);
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(2);
+    assert!(harness.state().selected.is_empty(), "Escape clears the selection");
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness.run_steps(2);
+    assert_eq!(harness.state().selected.len(), 4, "Ctrl+A selects every song");
+
+    harness.get_by_label("3. c long").click_secondary();
+    harness.run_steps(4);
+    harness.get_by_label("Add 4 songs to playlist");
+    harness.state_mut().apply(Action::NewPlaylistFromSelection);
+    harness.state_mut().new_playlist.as_mut().unwrap().name = "Everything".to_owned();
+    harness.state_mut().apply(Action::CreatePlaylist);
+    let text = fs::read_to_string(folder.0.join("Everything.m3u")).unwrap();
+    assert_eq!(text, "#EXTM3U\r\na short.wav\r\nb short2.wav\r\nc long.wav\r\nd corrupt.mp3\r\n");
+
+    // The test chose from the menu without clicking it, so the menu is still open.
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(4);
+    assert_eq!(harness.state().selected.len(), 4, "Escape closed the menu and kept the selection");
+    click(&mut harness, "3. c long");
+    assert!(harness.state().player.is_some(), "a plain click still plays");
+    assert!(harness.state().selected.is_empty());
+}
+
+/// A file dragged onto the window from Explorer.
+#[derive(Debug)]
+struct DroppedPath(PathBuf);
+
+impl egui::DroppedFile for DroppedPath {
+    fn path(&self) -> &Path {
+        &self.0
+    }
+
+    fn bytes(&self) -> Result<Vec<u8>, String> {
+        fs::read(&self.0).map_err(|err| err.to_string())
+    }
+}
+
+#[test]
+fn lyrics_are_pasted_written_and_dropped() {
+    let folder = TestFolder::new("add-lyrics");
+    write_silent_wav(&folder.0.join("e long.wav"), 20.0);
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "5. e long");
+    assert!(harness.state().lyrics.is_none());
+    harness.get_by_label("Write lyrics");
+
+    click(&mut harness, "Paste lyrics");
+    harness.event(egui::Event::Paste("[00:01.00]Hello\n[00:02.00]World".to_owned()));
+    harness.run_steps(2);
+    let lrc = folder.0.join("e long.lrc");
+    assert_eq!(harness.state().error, None);
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:01.00]Hello\r\n[00:02.00]World\r\n");
+    assert!(harness.state().lyrics.as_ref().unwrap().synced, "the pasted lyrics show at once");
+    assert_eq!(harness.state().notice.clone().unwrap().0, "Saved the lyrics of e long.");
+
+    click(&mut harness, "Edit lyrics");
+    assert_eq!(harness.state().lyrics_editor.as_ref().unwrap().text, "[00:01.00]Hello\n[00:02.00]World\n");
+    harness.state_mut().lyrics_editor.as_mut().unwrap().text = "Just words\nNo times".to_owned();
+    click(&mut harness, "Save");
+    assert!(harness.state().lyrics_editor.is_none());
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), "Just words\r\nNo times\r\n");
+    assert!(!harness.state().lyrics.as_ref().unwrap().synced);
+
+    click(&mut harness, "Edit lyrics");
+    harness.state_mut().lyrics_editor.as_mut().unwrap().text = "[ti:Only a header]".to_owned();
+    click(&mut harness, "Save");
+    let error = harness.state().lyrics_editor.as_ref().unwrap().error.clone();
+    assert_eq!(error.as_deref(), Some("These lyrics have no lines."), "the form stays open to fix them");
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(4);
+    assert!(harness.state().lyrics_editor.is_none(), "Escape closes the form");
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), "Just words\r\nNo times\r\n", "a closed form saves nothing");
+
+    let dropped = folder.0.join("downloaded.txt");
+    fs::write(&dropped, "\u{feff}[00:03.00]From a file\n").unwrap();
+    harness.input_mut().dropped_files.push(std::sync::Arc::new(DroppedPath(dropped)));
+    harness.run_steps(2);
+    assert_eq!(fs::read_to_string(&lrc).unwrap(), "[00:03.00]From a file\r\n");
+    assert_eq!(harness.state().lyrics.as_ref().unwrap().lines[0].text, "From a file");
+}
+
+#[test]
+fn romaji_and_translation_switch_under_the_lyrics() {
+    let folder = TestFolder::new("lyric-extras");
+    // Base64 of "hajimari" and "The beginning".
+    let lrc = "[00:00.50]始まり\n[00:10.00]Second line\n[x-romaji:500:aGFqaW1hcmk=]\n[x-translation:500:VGhlIGJlZ2lubmluZw==]\n";
+    fs::write(folder.0.join("c long.lrc"), lrc).unwrap();
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    assert_eq!(harness.state().lyric_extra(), Some(Extra::Romaji), "romaji shows first");
+    assert_eq!(harness.state().lyrics.as_ref().unwrap().lines[0].romaji.as_deref(), Some("hajimari"));
+
+    let switch = "Change what shows under each line";
+    click(&mut harness, switch);
+    assert_eq!(harness.state().lyric_extra(), Some(Extra::Translation));
+    click(&mut harness, switch);
+    assert_eq!(harness.state().lyric_extra(), None);
+    click(&mut harness, switch);
+    assert_eq!(harness.state().lyric_extra(), Some(Extra::Romaji));
+    assert!(harness.state().settings.serialize().contains("lyrics_extra=romaji"));
+
+    fs::write(folder.0.join("c long.lrc"), "[00:00.50]Plain\n").unwrap();
+    harness.state_mut().lyrics = amplo::lyrics::Lyrics::for_track(&folder.0.join("c long.wav"));
+    harness.run_steps(2);
+    assert!(harness.query_by_label(switch).is_none(), "lyrics without extras have no switch");
+}
+
+#[test]
+fn songs_come_out_of_playlists() {
+    let folder = TestFolder::new("remove-from-playlist");
+    let mut harness = harness_for(&folder);
+    harness.get_by_label("1. a short").click_secondary();
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Remove from All Songs").is_none(), "All Songs shows the folder");
+    harness.key_press(egui::Key::Escape);
+    harness.run_steps(4);
+
+    let mix = harness.state().library.playlists.iter().position(|playlist| playlist.name == "Mix").unwrap();
+    harness.state_mut().apply(Action::OpenPlaylist(mix));
+    harness.run_steps(4);
+    harness.get_by_label("1. c long").click_secondary();
+    harness.run_steps(4);
+    click(&mut harness, "Remove from Mix");
+    let text = fs::read_to_string(folder.0.join("Mix.m3u")).unwrap();
+    assert_eq!(text, "#EXTM3U\na short.wav\n");
+    assert_eq!(harness.state().notice.clone().unwrap().0, "Removed 1 song from Mix.");
+    wait_until(&mut harness, "the playlist to shrink", |app| app.library.playlists[mix].tracks.len() == 1);
+    assert!(folder.0.join("c long.wav").exists(), "the song file stays");
+
+    let liked: BTreeSet<PathBuf> = harness.state().library.tracks.iter().take(2).map(|track| track.path.clone()).collect();
+    harness.state_mut().settings.liked = liked.clone();
+    harness.state_mut().library.refresh_liked(&liked);
+    harness.state_mut().apply(Action::OpenPlaylist(amplo::library::LIKED_SONGS));
+    harness.run_steps(4);
+    harness.key_press_modifiers(egui::Modifiers::COMMAND, egui::Key::A);
+    harness.run_steps(2);
+    harness.get_by_label("1. a short").click_secondary();
+    harness.run_steps(4);
+    click(&mut harness, "Remove 2 songs from Liked Songs");
+    assert!(harness.state().settings.liked.is_empty(), "removing from Liked Songs unlikes");
+    assert_eq!(harness.state().view, ALL_SONGS, "an empty Liked Songs closes");
 }
 
 #[test]
