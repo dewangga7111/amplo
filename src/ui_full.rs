@@ -5,7 +5,7 @@ use eframe::egui::{
     self, Align2, Color32, CornerRadius, Key, Margin, Pos2, Rect, RichText, ScrollArea, Sense, Stroke, Ui,
     UiBuilder, Vec2, ViewportCommand, containers::scroll_area::ScrollSource, pos2, text::LayoutJob, vec2,
 };
-use amplo::library::{LIKED_SONGS, Playlist};
+use amplo::library::{Collection, LIKED_SONGS, Playlist, split_names};
 
 use crate::{
     app::{Action, App, CardTab, format_time},
@@ -13,12 +13,12 @@ use crate::{
     spotify_page::SpotifyAction,
     theme,
     ui::{
-        LyricStyle, UNKNOWN_TIME, artist_name, draw_empty_playlist, paint_empty_cover, plural_songs,
+        LyricStyle, UNKNOWN_TIME, artist_links, artist_name, draw_empty_playlist, row_artist_links, paint_empty_cover, plural_songs,
         title_bar_drag,
     },
     widgets::{
         IconButton, MarqueeText, accent_button, at, click_area, line, marquee, paint_equalizer, paint_icon,
-        paint_shadow, paint_text, paint_texture, paint_two_lines, pill_button, spaced_line,
+        paint_shadow, paint_text, paint_texture, paint_two_lines, pill_button, spaced_line, text_rects,
     },
 };
 
@@ -374,8 +374,31 @@ impl App {
         let mosaic = at(origin, PAD_X, HEADER_TOP, MOSAIC, MOSAIC);
         paint_shadow(ui, mosaic, 16, 20, 50, 115);
         let half = MOSAIC / 2.0;
-        for index in 0..4 {
-            let track = playlist.tracks[index % playlist.tracks.len()];
+        // An album has one cover, which fills the whole square. An artist or a genre shows the
+        // covers of its first albums.
+        let covers: Vec<usize> = match &playlist.collection {
+            Some(Collection::Album { .. }) => {
+                let texture = self.covers.texture(ui.ctx(), &self.library.tracks[playlist.tracks[0]].path);
+                paint_texture(ui, mosaic, texture, 16);
+                Vec::new()
+            }
+            Some(_) => {
+                let mut albums: Vec<&str> = Vec::new();
+                let mut firsts = Vec::new();
+                for &track in &playlist.tracks {
+                    let album = self.library.tracks[track].info.album.as_str();
+                    if firsts.len() < 4 && !albums.iter().any(|seen| seen.eq_ignore_ascii_case(album)) {
+                        albums.push(album);
+                        firsts.push(track);
+                    }
+                }
+                firsts
+            }
+            None => playlist.tracks.clone(),
+        };
+        let tiles = if covers.is_empty() { 0 } else { 4 };
+        for index in 0..tiles {
+            let track = covers[index % covers.len()];
             let radius = match index {
                 0 => CornerRadius { nw: 16, ..CornerRadius::ZERO },
                 1 => CornerRadius { ne: 16, ..CornerRadius::ZERO },
@@ -396,12 +419,20 @@ impl App {
         let buttons_top = mosaic.bottom() - 44.0;
 
         let seconds = total_seconds(self, playlist);
-        let meta = format!("{} · {} min {} sec", plural_songs(playlist.tracks.len()), seconds / 60, seconds % 60);
+        let mut meta = format!("{} · {} min {} sec", plural_songs(playlist.tracks.len()), seconds / 60, seconds % 60);
+        let kind = playlist.collection.as_ref().map_or("PLAYLIST", Collection::kind);
+        if let Some(Collection::Album { artist, .. }) = &playlist.collection {
+            let first = &self.library.tracks[playlist.tracks[0]].info;
+            let artist = if artist.is_empty() { &first.artist } else { artist };
+            if !artist.is_empty() {
+                meta = format!("{artist} · {meta}");
+            }
+        }
         let meta = line(ui, &meta, theme::inter(14.0), theme::SOFT, text_width);
         let meta_top = buttons_top - 18.0 - meta.size().y;
         let title = spaced_line(ui, &playlist.name, theme::grotesk_bold(52.0), theme::TEXT, text_width, -1.56);
         let title_top = meta_top - 10.0 - title.size().y;
-        let label = spaced_line(ui, "PLAYLIST", theme::inter_semibold(12.0), theme::MUTED, text_width, 0.96);
+        let label = spaced_line(ui, kind, theme::inter_semibold(12.0), theme::MUTED, text_width, 0.96);
         let label_top = title_top - 10.0 - label.size().y;
         ui.painter().galley(pos2(text_left, label_top), label, Color32::PLACEHOLDER);
         ui.painter().galley(pos2(text_left, title_top), title, Color32::PLACEHOLDER);
@@ -436,12 +467,49 @@ impl App {
             ui.painter().rect_filled(rect, 12.0, theme::FULL_ROW_HOVER);
         }
         self.song_row_input(ui, &response, row, actions);
-        self.paint_full_track(ui, rect, number, track, is_current);
+        let (artist, artist_origin) = self.paint_full_track(ui, rect, number, track, is_current);
+
+        // Each artist opens their songs, and the album name opens the album, unless it is
+        // the album shown.
+        let info = &self.library.tracks[track].info;
+        row_artist_links(ui, row, &artist, artist_origin, 0, &info.artist, actions);
+        let showing_album = self
+            .library
+            .playlists
+            .get(self.view)
+            .is_some_and(|playlist| matches!(playlist.collection, Some(Collection::Album { .. })));
+        if info.album.is_empty() || showing_album {
+            return;
+        }
+        let cols = columns(rect.left(), rect.width());
+        let album = line(ui, &info.album, theme::inter(13.0), theme::SOFT, cols.album_width);
+        let text = Align2::LEFT_CENTER.anchor_size(pos2(cols.album, rect.center().y), album.size());
+        let link = ui
+            .interact(text.expand2(vec2(2.0, 4.0)), ui.scope_id().with(("album-link", row)), Sense::click())
+            .on_hover_cursor(egui::CursorIcon::PointingHand);
+        let name = info.album.clone();
+        link.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, format!("Album: {name}")));
+        if link.hovered() {
+            ui.painter().hline(text.x_range(), text.bottom(), Stroke::new(1.0, theme::SOFT));
+        }
+        if link.clicked()
+            && let Some(album) = Collection::album_of(info)
+        {
+            actions.push(Action::OpenCollection(album));
+        }
     }
 
     /// One song in the table of a playlist or of the queue: its number, or an equalizer
-    /// while it plays, then cover, title, artist, album, and length.
-    fn paint_full_track(&mut self, ui: &Ui, rect: Rect, number: usize, track: usize, is_current: bool) {
+    /// while it plays, then cover, title, artist, album, and length. Returns the artist line
+    /// and where it is.
+    fn paint_full_track(
+        &mut self,
+        ui: &Ui,
+        rect: Rect,
+        number: usize,
+        track: usize,
+        is_current: bool,
+    ) -> (std::sync::Arc<egui::Galley>, Pos2) {
         let cols = columns(rect.left(), rect.width());
         let center_y = rect.center().y;
         if is_current {
@@ -460,7 +528,9 @@ impl App {
         let color = if is_current { theme::ACCENT } else { theme::TEXT };
         let title = line(ui, &info.title, theme::inter_semibold(15.0), color, text_width);
         let artist = line(ui, artist_name(&info.artist), theme::inter(13.0), theme::SOFT, text_width);
-        paint_two_lines(ui, cover.right() + 12.0, center_y, 3.0, title, artist);
+        // Where `paint_two_lines` puts the artist.
+        let artist_origin = pos2(cover.right() + 12.0, center_y + (title.size().y + 3.0 - artist.size().y) / 2.0);
+        paint_two_lines(ui, cover.right() + 12.0, center_y, 3.0, title, artist.clone());
 
         let album = line(ui, &info.album, theme::inter(13.0), theme::SOFT, cols.album_width);
         paint_text(ui, Align2::LEFT_CENTER, pos2(cols.album, center_y), album);
@@ -468,6 +538,7 @@ impl App {
         let time = info.duration.map_or_else(|| UNKNOWN_TIME.to_owned(), |duration| format_time(duration.as_secs_f32()));
         let time = line(ui, &time, theme::mono(13.0), theme::SOFT, 64.0);
         paint_text(ui, Align2::RIGHT_CENTER, pos2(cols.time_right, center_y), time);
+        (artist, artist_origin)
     }
 
     pub fn draw_full_now_playing(&mut self, ui: &mut Ui, panel: Rect, dt: f32, actions: &mut Vec<Action>) {
@@ -480,11 +551,13 @@ impl App {
         let content = Rect::from_min_max(panel.min + vec2(PAD_X, 28.0), panel.max - vec2(PAD_X, 32.0));
 
         let source = self.queue.as_ref().and_then(|queue| queue.playlist).and_then(|index| self.library.playlists.get(index));
+        let kind = source.and_then(|playlist| playlist.collection.as_ref()).map_or("PLAYLIST", Collection::kind);
+        let from = format!("PLAYING FROM {kind}");
         let source = source.map_or_else(|| "Queue".to_owned(), |playlist| playlist.name.clone());
         let back_text = line(ui, "Show playlist", theme::inter(13.0), Color32::PLACEHOLDER, 200.0);
         let back_width = 10.0 + 18.0 + 6.0 + back_text.size().x + 14.0;
         let back = Rect::from_min_size(pos2(content.right() - back_width, content.top()), vec2(back_width, 38.0));
-        let label = spaced_line(ui, "PLAYING FROM PLAYLIST", theme::inter_semibold(11.0), theme::MUTED, 300.0, 0.88);
+        let label = spaced_line(ui, &from, theme::inter_semibold(11.0), theme::MUTED, 300.0, 0.88);
         let name_width = (back.left() - 16.0 - content.left()).max(0.0);
         let name = line(ui, &source, theme::inter_semibold(15.0), theme::TEXT, name_width);
         paint_two_lines(ui, content.left(), back.center().y, 2.0, label, name);
@@ -547,12 +620,12 @@ impl App {
         let details: Vec<_> = [("ALBUM", &info.album), ("GENRE", &info.genre), ("FORMAT", &format)]
             .into_iter()
             .filter(|(_, value)| !value.is_empty())
-            .map(|(label, value)| {
-                let label = spaced_line(ui, label, theme::inter_semibold(10.0), theme::MUTED, details_width, 1.0);
+            .map(|(name, value)| {
+                let label = spaced_line(ui, name, theme::inter_semibold(10.0), theme::MUTED, details_width, 1.0);
                 let mut job = LayoutJob::simple(value.clone(), theme::inter(14.0), theme::SOFT, details_width);
                 job.halign = egui::Align::RIGHT;
                 job.wrap.max_rows = 4;
-                (label, ui.painter().layout_job(job))
+                (name, label, ui.painter().layout_job(job))
             })
             .collect();
 
@@ -560,7 +633,7 @@ impl App {
         const DETAIL_GAP: f32 = 12.0;
         const LIKE: f32 = 40.0;
         let details_height: f32 =
-            details.iter().map(|(label, value)| label.size().y + 4.0 + value.size().y + DETAIL_GAP).sum();
+            details.iter().map(|(_, label, value)| label.size().y + 4.0 + value.size().y + DETAIL_GAP).sum();
         let height = time.size().y + 4.0 + tech.len() as f32 * TECH_STEP + 16.0 + details_height + LIKE - 6.0;
         let mut y = (cover.bottom() + 6.0 - height).max(cover.top());
 
@@ -572,12 +645,52 @@ impl App {
             y += TECH_STEP;
         }
         y += 16.0;
-        for (label, value) in details {
+        for (name, label, value) in details {
             let label_height = label.size().y;
             paint_text(ui, Align2::RIGHT_TOP, pos2(info_right, y), label);
             y += label_height + 4.0;
             let value_height = value.size().y;
             // Right-aligned text is laid out to the left of its position.
+            let value_rect = value.rect.translate(vec2(info_right, y));
+            if name == "ALBUM" {
+                let link = click_area(ui, value_rect.expand(3.0), &format!("Album: {}", info.album));
+                if link.hovered() {
+                    ui.painter().hline(value_rect.x_range(), value_rect.bottom(), Stroke::new(1.0, theme::SOFT));
+                }
+                if link.clicked()
+                    && let Some(album) = Collection::album_of(info)
+                {
+                    actions.push(Action::OpenCollection(album));
+                }
+            }
+            // Each genre of the song opens on its own.
+            if name == "GENRE" {
+                for range in split_names(&info.genre) {
+                    let genre = &info.genre[range.clone()];
+                    let chars = info.genre[..range.start].chars().count()..info.genre[..range.end].chars().count();
+                    let rects = text_rects(&value, chars);
+                    let mut hovered = false;
+                    let mut clicked = false;
+                    for (part, rect) in rects.iter().enumerate() {
+                        let rect = rect.translate(vec2(info_right, y));
+                        let link = ui
+                            .interact(rect.expand(2.0), ui.scope_id().with(("genre-link", genre, part)), Sense::click())
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        link.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, format!("Genre: {genre}")));
+                        hovered |= link.hovered();
+                        clicked |= link.clicked();
+                    }
+                    if hovered {
+                        for rect in &rects {
+                            let rect = rect.translate(vec2(info_right, y));
+                            ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, theme::SOFT));
+                        }
+                    }
+                    if clicked {
+                        actions.push(Action::OpenCollection(Collection::Genre(genre.to_owned())));
+                    }
+                }
+            }
             ui.painter().galley(pos2(info_right, y), value, Color32::PLACEHOLDER);
             y += value_height + DETAIL_GAP;
         }
@@ -598,7 +711,7 @@ impl App {
         let title_height = marquee(ui, pos2(left, title_top), text_width, title, elapsed);
         let artist_top = title_top + title_height + 4.0;
         let artist = text(artist_name(&info.artist), theme::inter(15.0), theme::SOFT);
-        let artist_height = marquee(ui, pos2(left, artist_top), text_width, artist, elapsed);
+        let artist_height = artist_links(ui, pos2(left, artist_top), text_width, artist, elapsed, actions);
         let bars = Rect::from_min_size(pos2(left, artist_top + artist_height + 18.0), vec2(column, 36.0));
         self.draw_visualizer(ui, bars, 3.0);
 

@@ -11,7 +11,7 @@ use std::{
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::{Harness, kittest::Queryable};
 use amplo::{
-    library::ALL_SONGS,
+    library::{ALL_SONGS, Collection, split_names},
     lyrics::{Extra, Lyrics},
     settings::Settings,
 };
@@ -708,7 +708,7 @@ fn render_screens() {
     }
     // Only in memory, so a real music folder gets no new files.
     harness.state_mut().apply(Action::Minimize);
-    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), path: None };
+    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), path: None, collection: None };
     harness.state_mut().library.playlists.push(empty);
     let empty = harness.state().library.playlists.len() - 1;
     harness.state_mut().apply(Action::OpenPlaylist(empty));
@@ -748,6 +748,35 @@ fn render_screens() {
         if let Some(row) = with_lyrics(harness.state(), false) {
             harness.state_mut().apply(Action::PlayRow(row));
             settle(&mut harness, &format!("full-no-lyrics{suffix}"));
+            harness.state_mut().apply(Action::Minimize);
+        }
+    }
+    let numbered = harness.state().library.tracks.iter().position(|track| track.info.track_number.is_some() && !track.info.album.is_empty());
+    if let Some(track) = numbered {
+        let info = harness.state().library.tracks[track].info.clone();
+        harness.state_mut().apply(Action::OpenCollection(Collection::album_of(&info).unwrap()));
+        settle(&mut harness, "full-album");
+        harness.state_mut().apply(Action::PlayView);
+        harness.state_mut().apply(Action::Expand);
+        settle(&mut harness, "full-album-playing");
+        harness.state_mut().apply(Action::Minimize);
+        // The first artist and genre of a song that has several.
+        let several = |text: &str| split_names(text).len() > 1;
+        let info = harness.state().library.tracks.iter().map(|track| &track.info).find(|info| several(&info.artist)).cloned();
+        if let Some(info) = info {
+            let name = info.artist[split_names(&info.artist)[0].clone()].to_owned();
+            harness.state_mut().apply(Action::OpenCollection(Collection::Artist(name.clone())));
+            settle(&mut harness, "full-artist");
+            harness.query_all_by_label(&format!("Artist: {name}")).nth(1).unwrap().hover();
+            settle(&mut harness, "full-artist-hover");
+        }
+        let info = harness.state().library.tracks.iter().map(|track| &track.info).find(|info| several(&info.genre)).cloned();
+        if let Some(info) = info {
+            let name = info.genre[split_names(&info.genre)[0].clone()].to_owned();
+            harness.state_mut().apply(Action::OpenCollection(Collection::Genre(name)));
+            harness.state_mut().apply(Action::PlayView);
+            harness.state_mut().apply(Action::Expand);
+            settle(&mut harness, "full-genre-playing");
             harness.state_mut().apply(Action::Minimize);
         }
     }
@@ -1160,6 +1189,102 @@ fn songs_come_out_of_playlists() {
     click(&mut harness, "Remove 2 songs from Liked Songs");
     assert!(harness.state().settings.liked.is_empty(), "removing from Liked Songs unlikes");
     assert_eq!(harness.state().view, ALL_SONGS, "an empty Liked Songs closes");
+}
+
+#[test]
+fn an_album_lists_its_songs_in_track_order_and_plays_them_all() {
+    let folder = TestFolder::new("album");
+    let mut harness = harness_for(&folder);
+    for (title, album, number) in [("a short", "Night", Some(2)), ("b short2", "Night", None), ("c long", "Night", Some(1)), ("d corrupt", "Day", Some(1))] {
+        let app = harness.state_mut();
+        let track = app.library.tracks.iter_mut().find(|track| track.info.title == title).unwrap();
+        track.info.album = album.to_owned();
+        track.info.track_number = number;
+    }
+    harness.run_steps(2);
+    harness.get_by_label("1. a short").click_secondary();
+    harness.run_steps(4);
+    click(&mut harness, "Go to album");
+
+    let app = harness.state();
+    let album = &app.library.playlists[app.view];
+    assert_eq!(album.collection, Some(Collection::Album { name: "Night".to_owned(), artist: String::new() }));
+    let titles: Vec<&str> = album.tracks.iter().map(|&track| app.library.tracks[track].info.title.as_str()).collect();
+    assert_eq!(titles, ["c long", "a short", "b short2"], "track numbers first, unnumbered songs last");
+
+    harness.state_mut().apply(Action::PlayView);
+    harness.run_steps(2);
+    let app = harness.state();
+    let queue = app.queue.as_ref().unwrap();
+    assert_eq!(queue.playlist, Some(app.view));
+    assert_eq!(queue.original, app.library.playlists[app.view].tracks, "the whole album is queued");
+    assert_eq!(current_title(&harness), "c long");
+    assert!(harness.query_by_label("Go to album").is_none());
+}
+
+#[test]
+fn each_artist_and_genre_opens_their_songs() {
+    let folder = TestFolder::new("artist-genre");
+    let mut harness = harness_for(&folder);
+    let tags = [
+        // Only `c long` plays long enough to look at.
+        ("a short", "Mili", "Rock", "Alpha", 2),
+        ("b short2", "Someone", "Pop", "", 1),
+        ("c long", "Mili, Yamato Kasai", "Rock; Pop", "Zeta", 1),
+        ("d corrupt", "", "", "", 1),
+    ];
+    // Playing a song reads its tags from the file again, so they are set after each start.
+    let set_tags = |harness: &mut Harness<'static, App>| {
+        for (title, artist, genre, album, number) in tags {
+            let app = harness.state_mut();
+            let track = app.library.tracks.iter_mut().find(|track| track.info.title == title).unwrap();
+            (track.info.artist, track.info.genre, track.info.album) = (artist.to_owned(), genre.to_owned(), album.to_owned());
+            track.info.track_number = Some(number);
+        }
+    };
+    let shown_titles = |harness: &Harness<'static, App>| -> Vec<String> {
+        let app = harness.state();
+        app.library.playlists[app.view].tracks.iter().map(|&track| app.library.tracks[track].info.title.clone()).collect()
+    };
+    set_tags(&mut harness);
+    harness.run_steps(2);
+    assert_eq!(harness.query_all_by_label("Artist: Mili").count(), 2, "each row links its artists");
+    click(&mut harness, "Artist: Yamato Kasai");
+    assert_eq!(shown_titles(&harness), ["c long"], "from the song list");
+    harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
+    harness.run_steps(2);
+
+    harness.state_mut().apply(Action::PlayRow(2));
+    set_tags(&mut harness);
+    harness.state_mut().apply(Action::Expand);
+    harness.run_steps(4);
+    click(&mut harness, "Artist: Yamato Kasai");
+    assert_eq!(shown_titles(&harness), ["c long"]);
+    assert!(harness.state().minimized, "the songs show in place of Now Playing");
+    harness.state_mut().apply(Action::Expand);
+    harness.run_steps(4);
+    click(&mut harness, "Artist: Mili");
+    assert_eq!(shown_titles(&harness), ["a short", "c long"], "album by album");
+    assert_eq!(harness.state().library.playlists.len(), 4, "the artist replaced the one shown before");
+
+    harness.set_size(egui::vec2(1280.0, 780.0));
+    harness.state_mut().full = true;
+    harness.state_mut().apply(Action::Expand);
+    harness.run_steps(6);
+    assert!(harness.query_by_label("Genre: Rock; Pop").is_none());
+    click(&mut harness, "Genre: Pop");
+    assert_eq!(shown_titles(&harness), ["c long", "b short2"], "artist by artist");
+    harness.get_by_label("Artist: Someone");
+    harness.state_mut().apply(Action::PlayView);
+    set_tags(&mut harness);
+    harness.run_steps(2);
+    let app = harness.state();
+    assert_eq!(app.queue.as_ref().unwrap().original, app.library.playlists[app.view].tracks, "the whole genre is queued");
+    assert_eq!(current_title(&harness), "c long");
+    harness.state_mut().apply(Action::Expand);
+    harness.run_steps(4);
+    harness.get_by_label("Genre: Rock");
+    harness.get_by_label("Album: Zeta");
 }
 
 #[test]

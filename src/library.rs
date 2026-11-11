@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeSet, HashMap},
     fs,
+    ops::Range,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -11,7 +12,7 @@ use lofty::{
     config::ParseOptions,
     file::{AudioFile, TaggedFileExt},
     probe::Probe,
-    tag::Accessor,
+    tag::{Accessor, ItemKey},
 };
 use walkdir::WalkDir;
 
@@ -25,6 +26,10 @@ pub struct TrackInfo {
     pub title: String,
     pub artist: String,
     pub album: String,
+    /// The artist of the whole album. Compilations have one, while each song has its own artist.
+    pub album_artist: String,
+    pub track_number: Option<u32>,
+    pub disc_number: Option<u32>,
     pub genre: String,
     pub duration: Option<Duration>,
     pub bitrate_kbps: Option<u32>,
@@ -52,6 +57,8 @@ pub struct Playlist {
     pub tracks: Vec<usize>,
     /// The `.m3u` file. All Songs and Liked Songs have none, so songs cannot be added to them.
     pub path: Option<PathBuf>,
+    /// Set for an album, artist, or genre opened from a song. It has no file either.
+    pub collection: Option<Collection>,
 }
 
 #[derive(Debug, Default)]
@@ -104,9 +111,129 @@ pub fn read_info(path: &Path) -> TrackInfo {
         set(&mut info.title, tag.title());
         set(&mut info.artist, tag.artist());
         set(&mut info.album, tag.album());
+        set(&mut info.album_artist, tag.get_string(ItemKey::AlbumArtist).map(std::borrow::Cow::Borrowed));
         set(&mut info.genre, tag.genre());
+        info.track_number = tag.track().filter(|&number| number > 0);
+        info.disc_number = tag.disk().filter(|&number| number > 0);
     }
     info
+}
+
+/// Names with a comma of their own, which [`split_names`] keeps whole.
+const NAMES_WITH_COMMAS: [&str; 3] = ["Tyler, The Creator", "Earth, Wind & Fire", "Crosby, Stills, Nash & Young"];
+
+/// Where each name is in an artist or genre tag that lists several, such as
+/// `Mili, Yamato Kasai` or `Alternative; Indie Rock`. Names are split at `, ` and `; ` only,
+/// as `&` and `/` are part of names such as `MYTH & ROID` and `Indie Rock/Rock pop`.
+pub fn split_names(text: &str) -> Vec<Range<usize>> {
+    let mut names = Vec::new();
+    let mut start = 0;
+    while start < text.len() {
+        let rest = &text[start..];
+        let whole = |name: &&&str| {
+            rest.get(..name.len()).is_some_and(|head| head.eq_ignore_ascii_case(name))
+                && rest.get(name.len()..).is_some_and(|after| after.is_empty() || after.starts_with(", ") || after.starts_with("; "))
+        };
+        let length = match NAMES_WITH_COMMAS.iter().find(whole) {
+            Some(name) => name.len(),
+            None => [", ", "; "].iter().filter_map(|separator| rest.find(separator)).min().unwrap_or(rest.len()),
+        };
+        let piece = &rest[..length];
+        let lead = piece.len() - piece.trim_start().len();
+        let trimmed = piece.trim();
+        if !trimmed.is_empty() {
+            names.push(start + lead..start + lead + trimmed.len());
+        }
+        // Both separators are two bytes long.
+        start += length + 2;
+    }
+    names
+}
+
+/// Whether one of the names in an artist or genre tag is `name`.
+fn names_include(text: &str, name: &str) -> bool {
+    split_names(text).into_iter().any(|range| text[range].eq_ignore_ascii_case(name))
+}
+
+/// Songs grouped by what their tags share. Opening one shows its songs as a playlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Collection {
+    /// An album name, and the album artist when the tags have one.
+    Album { name: String, artist: String },
+    /// One of the artists of a song.
+    Artist(String),
+    /// One of the genres of a song.
+    Genre(String),
+}
+
+impl Collection {
+    /// The album of a song. `None` for a song without an album name.
+    pub fn album_of(info: &TrackInfo) -> Option<Self> {
+        (!info.album.is_empty()).then(|| Self::Album { name: info.album.clone(), artist: info.album_artist.clone() })
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Album { name, .. } | Self::Artist(name) | Self::Genre(name) => name,
+        }
+    }
+
+    /// The word above the name in the header, and in "Playing from".
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Album { .. } => "ALBUM",
+            Self::Artist(_) => "ARTIST",
+            Self::Genre(_) => "GENRE",
+        }
+    }
+
+    /// Songs without an album artist match an album by its name alone, as many files lack one.
+    fn contains(&self, info: &TrackInfo) -> bool {
+        match self {
+            Self::Album { name, artist } => {
+                info.album.eq_ignore_ascii_case(name)
+                    && (artist.is_empty() || info.album_artist.eq_ignore_ascii_case(artist))
+            }
+            Self::Artist(name) => names_include(&info.artist, name),
+            Self::Genre(name) => names_include(&info.genre, name),
+        }
+    }
+}
+
+impl Library {
+    /// The songs of a collection as a playlist. An album is in the order of its discs and
+    /// track numbers. An artist goes album by album in the same order, and a genre goes
+    /// artist by artist. Songs without a number come last in their album, by title.
+    pub fn collection(&self, collection: &Collection) -> Playlist {
+        let mut tracks: Vec<usize> =
+            (0..self.tracks.len()).filter(|&track| collection.contains(&self.tracks[track].info)).collect();
+        let in_album = |info: &TrackInfo| {
+            (info.disc_number.unwrap_or(1), info.track_number.is_none(), info.track_number, info.title.to_lowercase())
+        };
+        let album = |info: &TrackInfo| (info.album.is_empty(), info.album.to_lowercase());
+        tracks.sort_by_cached_key(|&track| {
+            let info = &self.tracks[track].info;
+            let artist = match collection {
+                Collection::Genre(_) => info.artist.to_lowercase(),
+                Collection::Album { .. } | Collection::Artist(_) => String::new(),
+            };
+            (artist, album(info), in_album(info))
+        });
+        Playlist { name: collection.name().to_owned(), tracks, path: None, collection: Some(collection.clone()) }
+    }
+
+    /// Shows a collection as the last playlist, in place of the one shown before. Returns
+    /// its position. Collections do not show in the sidebar.
+    pub fn show_collection(&mut self, collection: Playlist) -> usize {
+        self.playlists.retain(|playlist| playlist.collection.is_none());
+        self.playlists.push(collection);
+        self.playlists.len() - 1
+    }
+
+    /// The collection shown, if any.
+    pub fn shown_collection(&self) -> Option<&Collection> {
+        self.playlists.last().and_then(|playlist| playlist.collection.as_ref())
+    }
 }
 
 /// Windows paths are not case sensitive, and playlists can use either slash.
@@ -296,8 +423,8 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
 
     let mut library = Library {
         playlists: vec![
-            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None },
-            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None },
+            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None, collection: None },
+            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None, collection: None },
         ],
         tracks,
         missing_entries: 0,
@@ -320,7 +447,7 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
         library.missing_entries += entries.len() - found.len();
         // A new playlist has no songs yet. One whose songs are all missing stays hidden.
         if entries.is_empty() || !found.is_empty() {
-            library.playlists.push(Playlist { name: playlist_name(&file), tracks: found, path: Some(file) });
+            library.playlists.push(Playlist { name: playlist_name(&file), tracks: found, path: Some(file), collection: None });
         }
     }
     library
@@ -406,6 +533,99 @@ mod tests {
         assert!(blank.is_err());
         assert_eq!(with_songs.unwrap(), "Mix");
         assert_eq!(mix.unwrap(), "#EXTM3U\r\nsub\\a.flac\r\nZ:\\b.mp3\r\n", "songs outside the folder keep a full path");
+    }
+
+    #[test]
+    fn albums_follow_disc_and_track_numbers() {
+        let song = |title: &str, album: &str, album_artist: &str, disc: Option<u32>, number: Option<u32>| Track {
+            path: PathBuf::from(format!("{title}.flac")),
+            info: TrackInfo {
+                title: title.to_owned(),
+                album: album.to_owned(),
+                album_artist: album_artist.to_owned(),
+                disc_number: disc,
+                track_number: number,
+                ..TrackInfo::default()
+            },
+        };
+        let mut library = Library {
+            tracks: vec![
+                song("Outro", "Night", "", None, None),
+                song("Two", "night", "", Some(1), Some(2)),
+                song("Disc two", "Night", "", Some(2), Some(1)),
+                song("One", "Night", "", None, Some(1)),
+                song("Other band", "Night", "Someone else", Some(1), Some(1)),
+                song("Elsewhere", "Day", "", Some(1), Some(1)),
+                song("Intro", "Night", "", None, None),
+            ],
+            playlists: Vec::new(),
+            missing_entries: 0,
+        };
+        let key = Collection::album_of(&library.tracks[0].info).unwrap();
+        let album = library.collection(&key);
+        let titles: Vec<&str> = album.tracks.iter().map(|&track| library.tracks[track].info.title.as_str()).collect();
+        assert_eq!(titles, ["One", "Other band", "Two", "Intro", "Outro", "Disc two"], "no album artist matches the name only");
+        let strict = library.collection(&Collection::album_of(&library.tracks[4].info).unwrap());
+        assert_eq!(strict.tracks, [4], "an album artist keeps other albums of that name out");
+        assert_eq!(Collection::album_of(&TrackInfo::default()), None);
+
+        let first = library.show_collection(album);
+        let second = library.show_collection(strict);
+        assert_eq!((first, second, library.playlists.len()), (0, 0, 1), "one collection shows at a time");
+        assert_eq!(
+            library.shown_collection(),
+            Some(&Collection::Album { name: "Night".to_owned(), artist: "Someone else".to_owned() })
+        );
+    }
+
+    #[test]
+    fn splits_artists_and_genres_into_names() {
+        let names = |text: &'static str| -> Vec<&'static str> { split_names(text).into_iter().map(|range| &text[range]).collect() };
+        assert_eq!(names("Mili, Yamato Kasai, Cassie Wei"), ["Mili", "Yamato Kasai", "Cassie Wei"]);
+        assert_eq!(names("Alternative; Indie Rock"), ["Alternative", "Indie Rock"]);
+        assert_eq!(names("MYTH & ROID"), ["MYTH & ROID"]);
+        assert_eq!(names("Rock, Indie Rock/Rock pop"), ["Rock", "Indie Rock/Rock pop"]);
+        assert_eq!(names("nothing,nowhere."), ["nothing,nowhere."]);
+        assert_eq!(names("Tyler, The Creator, Kali Uchis"), ["Tyler, The Creator", "Kali Uchis"]);
+        assert_eq!(names("Kali Uchis, Tyler, The Creator"), ["Kali Uchis", "Tyler, The Creator"]);
+        assert_eq!(names("Tyler, The Creators"), ["Tyler", "The Creators"]);
+        assert_eq!(names("宝鐘マリン, Kobo Kanaeru"), ["宝鐘マリン", "Kobo Kanaeru"]);
+        assert_eq!(names(" A ,  ; B"), ["A", "B"]);
+        assert!(names("").is_empty());
+    }
+
+    #[test]
+    fn artists_go_album_by_album_and_genres_artist_by_artist() {
+        let song = |title: &str, artist: &str, album: &str, genre: &str, number: u32| Track {
+            path: PathBuf::from(format!("{title}.flac")),
+            info: TrackInfo {
+                title: title.to_owned(),
+                artist: artist.to_owned(),
+                album: album.to_owned(),
+                genre: genre.to_owned(),
+                track_number: Some(number),
+                ..TrackInfo::default()
+            },
+        };
+        let library = Library {
+            tracks: vec![
+                song("Zeta two", "Mili", "Zeta", "Pop", 2),
+                song("Single", "Mili, Yamato Kasai", "", "Rock; Pop", 1),
+                song("Alpha one", "mili", "Alpha", "Metal", 1),
+                song("Zeta one", "Mili", "Zeta", "Pop", 1),
+                song("Elsewhere", "Milia", "Alpha", "Pop", 3),
+            ],
+            playlists: Vec::new(),
+            missing_entries: 0,
+        };
+        let titles = |collection: Collection| -> Vec<String> {
+            let playlist = library.collection(&collection);
+            assert_eq!(playlist.name, collection.name());
+            playlist.tracks.iter().map(|&track| library.tracks[track].info.title.clone()).collect()
+        };
+        assert_eq!(titles(Collection::Artist("Mili".to_owned())), ["Alpha one", "Zeta one", "Zeta two", "Single"]);
+        assert_eq!(titles(Collection::Artist("Yamato Kasai".to_owned())), ["Single"]);
+        assert_eq!(titles(Collection::Genre("pop".to_owned())), ["Zeta one", "Zeta two", "Single", "Elsewhere"]);
     }
 
     #[test]

@@ -258,6 +258,77 @@ pub fn marquee(ui: &Ui, top_left: Pos2, width: f32, text: MarqueeText<'_>, elaps
     size.y
 }
 
+/// A [`marquee`] with parts that can be clicked one by one, such as each artist of a song.
+/// `links` are byte ranges of the text, each with what screen readers announce for it.
+/// Returns the height of the line and the index of the link clicked.
+pub fn marquee_links(
+    ui: &Ui,
+    top_left: Pos2,
+    width: f32,
+    text: MarqueeText<'_>,
+    elapsed: f64,
+    links: &[(std::ops::Range<usize>, String)],
+) -> (f32, Option<usize>) {
+    let (whole, font, color) = (text.text, text.font.clone(), text.color);
+    let height = marquee(ui, top_left, width, text, elapsed);
+    let text_width = |text: &str| line(ui, text, font.clone(), color, f32::INFINITY).size().x;
+    let full = text_width(whole);
+    let visible = Rect::from_min_size(top_left, vec2(width, height));
+    // The same sums as `marquee`, so the links move with the text.
+    let (offset, copies) = if full <= width { (0.0, 1) } else { (marquee_offset(elapsed, full + MARQUEE_GAP), 2) };
+    let mut clicked = None;
+    for (index, (range, label)) in links.iter().enumerate() {
+        let end = text_width(&whole[..range.end]);
+        let start = end - text_width(&whole[range.clone()]);
+        for copy in 0..copies {
+            let left = top_left.x + copy as f32 * (full + MARQUEE_GAP) - offset;
+            let rect = Rect::from_x_y_ranges(left + start..=left + end, visible.y_range()).intersect(visible);            if rect.width() < 1.0 {
+                continue;
+            }
+            let response = ui
+                .interact(rect, ui.scope_id().with((label, copy)), Sense::click())
+                .on_hover_cursor(CursorIcon::PointingHand);
+            response.widget_info(|| WidgetInfo::labeled(egui::Role::Link, true, label));
+            if response.hovered() {
+                ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, color));
+            }
+            if response.clicked() {
+                clicked = Some(index);
+            }
+        }
+    }
+    (height, clicked)
+}
+
+/// Where a part of a laid-out text is, relative to the galley, with one rectangle for each
+/// row the part spans. `chars` counts characters, not bytes. Text cut off by an ellipsis
+/// has no place.
+pub fn text_rects(galley: &Galley, chars: std::ops::Range<usize>) -> Vec<Rect> {
+    let mut rects = Vec::new();
+    let mut index = 0;
+    // The ellipsis is the last glyph, in place of the characters cut off.
+    let glyphs: usize = galley.rows.iter().map(|row| row.glyphs.len()).sum();
+    let shown = if galley.elided { glyphs.saturating_sub(1) } else { glyphs };
+    let mut glyph_number = 0;
+    for row in &galley.rows {
+        let mut rect = Rect::NOTHING;
+        for glyph in &row.glyphs {
+            if chars.contains(&index) && glyph_number < shown {
+                rect = rect.union(glyph.logical_rect().translate(row.pos.to_vec2()));
+            }
+            index += 1;
+            glyph_number += 1;
+        }
+        if row.ends_with_newline {
+            index += 1;
+        }
+        if rect.is_positive() {
+            rects.push(rect);
+        }
+    }
+    rects
+}
+
 /// A rounded button with an icon and a word, such as Play beside a playlist's title.
 /// `filled` gives it the accent color, and otherwise it has an outline.
 pub fn pill_button(

@@ -2,12 +2,12 @@
 //! both layouts share are here too. The full layout is in `ui_full.rs`.
 
 use eframe::egui::{
-    self, Align2, Color32, CornerRadius, Pos2, Rect, ScrollArea, Sense, Stroke, TextFormat, Ui, UiBuilder,
+    self, Align2, Color32, CornerRadius, Galley, Pos2, Rect, ScrollArea, Sense, Stroke, TextFormat, Ui, UiBuilder,
     Vec2, ViewportCommand, containers::scroll_area::ScrollSource, pos2, text::{LayoutJob, TextWrapping},
     vec2,
 };
 use amplo::{
-    library::{ALL_SONGS, LIKED_SONGS, Playlist},
+    library::{ALL_SONGS, Collection, LIKED_SONGS, Playlist, split_names},
     lyrics::Extra,
 };
 
@@ -16,9 +16,9 @@ use crate::{
     theme,
     ui_full,
     widgets::{
-        IconButton, MarqueeText, accent_button, at, button_width, click_area, line, marquee, paint_edge_fades,
+        IconButton, MarqueeText, accent_button, at, button_width, click_area, line, marquee, marquee_links, paint_edge_fades,
         paint_equalizer, paint_icon, paint_shadow, paint_text, paint_texture, paint_two_lines, slider, spaced_line,
-        text_button,
+        text_button, text_rects,
     },
 };
 
@@ -520,7 +520,8 @@ impl App {
             .filter(|&index| match index {
                 ALL_SONGS => !self.library.tracks.is_empty(),
                 LIKED_SONGS => !self.library.playlists[index].tracks.is_empty(),
-                _ => true,
+                // An album, an artist, or a genre opens from its songs, not from the sidebar.
+                _ => self.library.playlists[index].collection.is_none(),
             })
             .collect()
     }
@@ -809,8 +810,17 @@ impl App {
                 }
             });
         });
-        // All Songs shows the folder, so it has nothing to remove from.
         let Some(playlist) = self.library.playlists.get(self.view) else { return };
+        // Only for one song, as the selection can span albums.
+        if count == 1
+            && let Some(&track) = playlist.tracks.get(row)
+            && let Some(album) = Collection::album_of(&self.library.tracks[track].info)
+            && playlist.collection.as_ref() != Some(&album)
+            && ui.button("Go to album").clicked()
+        {
+            actions.push(Action::OpenCollection(album));
+        }
+        // All Songs shows the folder, so it has nothing to remove from.
         if self.view == LIKED_SONGS || playlist.path.is_some() {
             let label = if count > 1 {
                 format!("Remove {count} songs from {}", playlist.name)
@@ -863,6 +873,10 @@ impl App {
         }
         job.wrap = TextWrapping::truncate_at_width(title_width);
         let title = ui.painter().layout_job(job);
+        let origin = Align2::LEFT_CENTER.anchor_size(pos2(title_left, center_y), title.size()).min;
+        // The artists come after the title and " · ".
+        let first_char = info.title.chars().count() + 3;
+        row_artist_links(ui, row, &title, origin, first_char, &info.artist, actions);
         paint_text(ui, Align2::LEFT_CENTER, pos2(title_left, center_y), title);
 
         let time = info
@@ -917,7 +931,7 @@ impl App {
         let title_height = marquee(ui, pos2(left, title_top), column, title, elapsed);
         let artist = text(artist_name(&info.artist), theme::inter(13.0), theme::SOFT);
         let artist_top = title_top + title_height + 2.0;
-        let artist_height = marquee(ui, pos2(left, artist_top), column, artist, elapsed);
+        let artist_height = artist_links(ui, pos2(left, artist_top), column, artist, elapsed, actions);
 
         let bars_top = artist_top + artist_height + 10.0;
         self.draw_visualizer(ui, Rect::from_min_size(pos2(left, bars_top), vec2(column, 26.0)), 2.0);
@@ -1421,6 +1435,57 @@ fn lyric_slot_height(text_height: f32, min_slot: f32) -> f32 {
 /// The artist, or a note that the file does not say.
 pub fn artist_name(artist: &str) -> &str {
     if artist.is_empty() { "Unknown artist" } else { artist }
+}
+
+/// The artist line of Now Playing. Each artist of the song opens their songs. Returns the
+/// height of the line.
+pub fn artist_links(ui: &Ui, top_left: Pos2, width: f32, text: MarqueeText<'_>, elapsed: f64, actions: &mut Vec<Action>) -> f32 {
+    let artist = text.text;
+    // "Unknown artist" stands for no artist, so it opens nothing.
+    let names = if artist == artist_name("") { Vec::new() } else { split_names(artist) };
+    let links: Vec<_> = names.into_iter().map(|range| (range.clone(), format!("Artist: {}", &artist[range]))).collect();
+    let (height, clicked) = marquee_links(ui, top_left, width, text, elapsed, &links);
+    if let Some(index) = clicked {
+        actions.push(Action::OpenCollection(Collection::Artist(artist[links[index].0.clone()].to_owned())));
+    }
+    height
+}
+
+/// Makes each artist in a song row a link that opens their songs. The row's text is `galley`,
+/// painted at `origin`, and the artist tag starts at its character `first_char`. Artists cut
+/// off by the end of the row are not links.
+pub fn row_artist_links(
+    ui: &Ui,
+    row: usize,
+    galley: &Galley,
+    origin: Pos2,
+    first_char: usize,
+    artist: &str,
+    actions: &mut Vec<Action>,
+) {
+    for (index, range) in split_names(artist).into_iter().enumerate() {
+        let name = &artist[range.clone()];
+        let start = first_char + artist[..range.start].chars().count();
+        let chars = start..first_char + artist[..range.end].chars().count();
+        let rects: Vec<Rect> =
+            text_rects(galley, chars).into_iter().map(|rect| rect.translate(origin.to_vec2())).collect();
+        let mut hovered = false;
+        for (part, rect) in rects.iter().enumerate() {
+            let link = ui
+                .interact(*rect, ui.scope_id().with(("artist-link", row, index, part)), Sense::click())
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            link.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Link, true, format!("Artist: {name}")));
+            hovered |= link.hovered();
+            if link.clicked() {
+                actions.push(Action::OpenCollection(Collection::Artist(name.to_owned())));
+            }
+        }
+        if hovered {
+            for rect in &rects {
+                ui.painter().hline(rect.x_range(), rect.bottom() - 1.0, Stroke::new(1.0, theme::SOFT));
+            }
+        }
+    }
 }
 
 /// Lays out text over as many rows as it needs, without shortening it.

@@ -17,7 +17,7 @@ use std::{
 use eframe::egui;
 use amplo::{
     audio::open_source,
-    library::{self, ALL_SONGS, LIKED_SONGS, Library, TrackInfo},
+    library::{self, ALL_SONGS, Collection, LIKED_SONGS, Library, TrackInfo},
     lyrics::{Extra, Lyrics},
     settings::Settings,
     spectrum::{Analyzer, SampleBuffer, Tap},
@@ -159,6 +159,8 @@ pub enum Action {
     CloseLyricsEditor,
     /// Shows the next of nothing, romaji, and translation under each lyric line.
     CycleLyricsExtra,
+    /// Shows the songs of an album, an artist, or a genre.
+    OpenCollection(Collection),
     Expand,
     Minimize,
     ToggleLike,
@@ -474,7 +476,10 @@ impl App {
                         self.library_revision += 1;
                     }
                 }
-                ScanEvent::Finished { generation } if generation == self.generation => self.scanning = false,
+                ScanEvent::Finished { generation } if generation == self.generation => {
+                    self.scanning = false;
+                    self.update_shown_collection();
+                }
                 _ => {}
             }
         }
@@ -517,11 +522,17 @@ impl App {
                 track.info = info.clone();
             }
         }
+        // The album, artist, or genre shown stays, with the songs it has now.
+        if let Some(collection) = self.library.shown_collection() {
+            let songs = library.collection(collection);
+            library.show_collection(songs);
+        }
         let positions: HashMap<&Path, usize> =
             library.tracks.iter().enumerate().map(|(index, track)| (track.path.as_path(), index)).collect();
+        // An album can have the name of a playlist, so the kind has to match too.
         let playlist_named = |old: usize| {
-            let name = &self.library.playlists.get(old)?.name;
-            library.playlists.iter().position(|playlist| playlist.name == *name)
+            let old = self.library.playlists.get(old)?;
+            library.playlists.iter().position(|playlist| playlist.name == old.name && playlist.collection == old.collection)
         };
 
         let view = playlist_named(self.view)
@@ -952,6 +963,43 @@ impl App {
         }
     }
 
+    /// Shows the songs of an album, an artist, or a genre, in album and track order. Playing
+    /// from it queues all of them.
+    fn open_collection(&mut self, collection: Collection) {
+        let songs = self.library.collection(&collection);
+        if songs.tracks.is_empty() {
+            return;
+        }
+        let replaced = self.library.shown_collection().is_some_and(|shown| *shown != collection);
+        let index = self.library.show_collection(songs);
+        if replaced && let Some(queue) = &mut self.queue
+            && queue.playlist == Some(index)
+        {
+            // The queue came from the collection shown before, which this one replaces.
+            queue.playlist = None;
+        }
+        self.view = index;
+        self.selected.clear();
+        self.select_anchor = None;
+        self.search.clear();
+        self.minimized = true;
+        self.spotify_open = false;
+    }
+
+    /// Songs found by the scan join the collection shown. Their tags come in after the song list.
+    fn update_shown_collection(&mut self) {
+        let Some(collection) = self.library.shown_collection() else { return };
+        let songs = self.library.collection(collection);
+        let index = self.library.playlists.len() - 1;
+        if self.library.playlists[index].tracks != songs.tracks {
+            if self.view == index {
+                self.selected.clear();
+                self.select_anchor = None;
+            }
+            self.library.playlists[index] = songs;
+        }
+    }
+
     /// What can show under the lines of the current lyrics, starting with nothing.
     pub fn lyric_extra_choices(&self) -> Vec<Option<Extra>> {
         let mut choices = vec![None];
@@ -1129,6 +1177,7 @@ impl App {
             Action::EditLyrics => self.edit_lyrics(),
             Action::SaveLyrics => self.save_lyrics(),
             Action::CloseLyricsEditor => self.lyrics_editor = None,
+            Action::OpenCollection(collection) => self.open_collection(collection),
             Action::CycleLyricsExtra => {
                 let choices = self.lyric_extra_choices();
                 let current = choices.iter().position(|&choice| choice == self.lyric_extra()).unwrap_or(0);
