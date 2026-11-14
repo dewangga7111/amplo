@@ -449,6 +449,10 @@ impl App {
         if pill_button(ui, shuffle, theme::SHUFFLE, 17.0, shuffle_text, false, "Shuffle play").clicked() {
             actions.push(Action::ShufflePlayView);
         }
+        if self.view_is_sorted() {
+            let right = pos2(origin.x + width - PAD_X, shuffle.center().y);
+            self.draw_sort_button(ui, right, 36.0, actions);
+        }
 
         paint_table_heading(ui, origin.x + PAD_X, width - 2.0 * PAD_X, origin.y + TABLE_TOP);
     }

@@ -1,6 +1,6 @@
 [package]
 name = "amplo"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 default-run = "amplo"
 

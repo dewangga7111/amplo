@@ -11,7 +11,7 @@ use std::{
 use eframe::egui::{self, accesskit::Role};
 use egui_kittest::{Harness, kittest::Queryable};
 use amplo::{
-    library::{ALL_SONGS, Collection, split_names},
+    library::{ALL_SONGS, Collection, LIKED_SONGS, Sort, split_names},
     lyrics::{Extra, Lyrics},
     settings::Settings,
 };
@@ -46,7 +46,7 @@ struct TestFolder(PathBuf);
 
 impl TestFolder {
     /// All Songs: 1. a short, 2. b short2, 3. c long (20 s), 4. d corrupt.
-    /// Playlist `Mix`: c long, a short.
+    /// Playlist `Mix`: c long, a short in the file, which the title sort shows as a short, c long.
     fn new(test_name: &str) -> Self {
         let root = std::env::temp_dir().join(format!("amplo-{test_name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
@@ -67,8 +67,10 @@ impl Drop for TestFolder {
     }
 }
 
+/// The test files come into the folder at about the same moment, so the tests list them by
+/// title, which is the order of their names: a short, b short2, c long, d corrupt.
 fn silent_settings() -> Settings {
-    Settings { volume: 0.0, ..Settings::default() }
+    Settings { volume: 0.0, sort: Sort::Title, ..Settings::default() }
 }
 
 fn wait_until(harness: &mut Harness<'static, App>, what: &str, done: impl Fn(&App) -> bool) {
@@ -169,7 +171,7 @@ fn rows_play_in_the_list_and_the_mini_player_opens_now_playing() {
     assert!(harness.state().minimized);
     assert_eq!(harness.state().view, 2);
     assert_eq!(harness.state().queue.as_ref().unwrap().playlist, Some(0), "opening a playlist keeps the queue");
-    harness.get_by_label("2. a short");
+    harness.get_by_label("1. a short");
 }
 
 #[test]
@@ -275,6 +277,31 @@ fn a_lost_audio_output_opens_again_and_continues_the_track() {
 
     click(&mut harness, "Play");
     wait_until(&mut harness, "playback", |app| app.player.as_ref().unwrap().get_pos() > Duration::from_millis(8300));
+}
+
+/// After sleep, the output can stay on a device that was the default for a moment. Playing
+/// again moves it to the default device of Windows.
+#[test]
+fn an_output_on_another_device_moves_to_the_default_one() {
+    let folder = TestFolder::new("audio-device");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "3. c long");
+    harness.state().player.as_ref().unwrap().try_seek(Duration::from_secs(8)).unwrap();
+    click(&mut harness, "Pause");
+    let default = harness.state().sink_device.clone();
+    assert!(default.is_some(), "the output remembers its device");
+
+    harness.state_mut().sink_device = Some("another device".to_owned());
+    click(&mut harness, "Play");
+    harness.run_steps(2);
+    assert_eq!(harness.state().sink_device, default, "the output did not move to the default device");
+    assert_eq!(current_title(&harness), "c long");
+    assert!(!is_paused(&harness), "the track keeps playing");
+    assert!((position(&harness) - 8.0).abs() < 1.0, "continued at {}", position(&harness));
+
+    harness.state_mut().sink_device = Some("another device".to_owned());
+    harness.state_mut().apply(Action::PlayRow(0));
+    assert_eq!(harness.state().sink_device, default, "a new track opens on the default device");
 }
 
 #[test]
@@ -571,7 +598,7 @@ fn removing_files_updates_the_list_and_keeps_the_shown_playlist() {
     let folder = TestFolder::new("watch-remove");
     let mut harness = harness_for(&folder);
     click(&mut harness, "Mix");
-    click(&mut harness, "1. c long");
+    click(&mut harness, "2. c long");
 
     fs::remove_file(folder.0.join("a short.wav")).unwrap();
     wait_until(&mut harness, "removal", |app| app.library.tracks.len() == 3);
@@ -580,7 +607,7 @@ fn removing_files_updates_the_list_and_keeps_the_shown_playlist() {
     assert_eq!(current_title(&harness), "c long");
     assert_eq!(harness.state().queue.as_ref().unwrap().tracks.len(), 1);
     assert!(harness.state().player.is_some());
-    assert!(harness.query_by_label("2. a short").is_none());
+    assert!(harness.query_by_label("1. a short").is_none());
 
     // The playlist file goes too: the song keeps playing, and the view falls back.
     fs::remove_file(folder.0.join("Mix.m3u")).unwrap();
@@ -639,6 +666,9 @@ fn render_screens() {
         harness.run_steps(1);
     }
     settle(&mut harness, "list");
+    harness.get_by_label("Sort: Title").click();
+    settle(&mut harness, "list-sort-menu");
+    harness.key_press(egui::Key::Escape);
 
     harness.state_mut().apply(Action::Select(0, crate::app::Selection::Only));
     harness.state_mut().apply(Action::Select(2, crate::app::Selection::Range));
@@ -708,7 +738,7 @@ fn render_screens() {
     }
     // Only in memory, so a real music folder gets no new files.
     harness.state_mut().apply(Action::Minimize);
-    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), path: None, collection: None };
+    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), path: None, collection: None, in_file: Vec::new() };
     harness.state_mut().library.playlists.push(empty);
     let empty = harness.state().library.playlists.len() - 1;
     harness.state_mut().apply(Action::OpenPlaylist(empty));
@@ -728,6 +758,14 @@ fn render_screens() {
         harness.state_mut().full = true;
         harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
         settle(&mut harness, &format!("full-list{suffix}"));
+        if suffix.is_empty() {
+            harness.state_mut().apply(Action::SetSort(Sort::RecentlyAdded));
+            harness.run_steps(2);
+            harness.get_by_label("Sort: Recently added").click();
+            settle(&mut harness, "full-sort-menu");
+            harness.key_press(egui::Key::Escape);
+            harness.state_mut().apply(Action::SetSort(Sort::Title));
+        }
         if let Some(row) = with_lyrics(harness.state(), true) {
             harness.state_mut().apply(Action::PlayRow(row));
             harness.state_mut().apply(Action::Minimize);
@@ -881,7 +919,7 @@ fn spotify_page_marks_the_songs_the_folder_has() {
 
     click(&mut harness, "Mix");
     assert!(!harness.state().spotify_open, "a playlist replaces the Spotify page");
-    harness.get_by_label("1. c long");
+    harness.get_by_label("2. c long");
 }
 
 #[test]
@@ -1168,7 +1206,7 @@ fn songs_come_out_of_playlists() {
     let mix = harness.state().library.playlists.iter().position(|playlist| playlist.name == "Mix").unwrap();
     harness.state_mut().apply(Action::OpenPlaylist(mix));
     harness.run_steps(4);
-    harness.get_by_label("1. c long").click_secondary();
+    harness.get_by_label("2. c long").click_secondary();
     harness.run_steps(4);
     click(&mut harness, "Remove from Mix");
     let text = fs::read_to_string(folder.0.join("Mix.m3u")).unwrap();
@@ -1225,7 +1263,9 @@ fn an_album_lists_its_songs_in_track_order_and_plays_them_all() {
 #[test]
 fn each_artist_and_genre_opens_their_songs() {
     let folder = TestFolder::new("artist-genre");
-    let mut harness = harness_for(&folder);
+    // Sorted by artist: album by album, and a genre artist by artist.
+    let settings = Settings { sort: Sort::Artist, ..silent_settings() };
+    let mut harness = harness_with(&folder, settings, None);
     let tags = [
         // Only `c long` plays long enough to look at.
         ("a short", "Mili", "Rock", "Alpha", 2),
@@ -1285,6 +1325,60 @@ fn each_artist_and_genre_opens_their_songs() {
     harness.run_steps(4);
     harness.get_by_label("Genre: Rock");
     harness.get_by_label("Album: Zeta");
+}
+
+#[cfg(windows)]
+#[test]
+fn song_lists_show_the_newest_first_and_sort_by_title() {
+    use std::os::windows::fs::FileTimesExt;
+
+    let folder = TestFolder::new("sort");
+    // Newest first: c long, a short, b short2, d corrupt.
+    let base = std::time::SystemTime::now() - Duration::from_secs(3600);
+    for (name, minutes) in [("d corrupt.mp3", 0), ("b short2.wav", 10), ("a short.wav", 20), ("c long.wav", 30)] {
+        let file = fs::OpenOptions::new().write(true).open(folder.0.join(name)).unwrap();
+        file.set_times(fs::FileTimes::new().set_created(base + Duration::from_secs(minutes * 60))).unwrap();
+    }
+    let settings_path = folder.0.join("settings.txt");
+    let mut harness = harness_with(&folder, Settings { volume: 0.0, ..Settings::default() }, Some(settings_path.clone()));
+    let titles = |harness: &Harness<'static, App>, view: usize| -> Vec<String> {
+        let app = harness.state();
+        app.library.playlists[view].tracks.iter().map(|&track| app.library.tracks[track].info.title.clone()).collect()
+    };
+    assert_eq!(titles(&harness, ALL_SONGS), ["c long", "a short", "b short2", "d corrupt"], "recently added comes first");
+
+    click(&mut harness, "Sort: Recently added");
+    click(&mut harness, "Title");
+    assert_eq!(titles(&harness, ALL_SONGS), ["a short", "b short2", "c long", "d corrupt"]);
+    assert!(fs::read_to_string(&settings_path).unwrap().contains("sort=title"), "the order is remembered");
+    harness.get_by_label("Sort: Title");
+
+    let liked: BTreeSet<PathBuf> =
+        ["c long.wav", "a short.wav"].into_iter().map(|name| folder.0.join(name)).collect();
+    harness.state_mut().settings.liked = liked.clone();
+    harness.state_mut().library.refresh_liked(&liked);
+    assert_eq!(titles(&harness, LIKED_SONGS), ["a short", "c long"], "Liked Songs follows the sort");
+
+    // The file lists c long, then a short.
+    let mix = harness.state().library.playlists.iter().position(|playlist| playlist.name == "Mix").unwrap();
+    harness.state_mut().apply(Action::OpenPlaylist(mix));
+    harness.run_steps(4);
+    assert_eq!(titles(&harness, mix), ["a short", "c long"], "playlists follow the sort too");
+    click(&mut harness, "Sort: Title");
+    click(&mut harness, "Recently added");
+    assert_eq!(titles(&harness, mix), ["a short", "c long"], "the song added to the playlist last comes first");
+
+    // An album keeps its track order and has no sort menu.
+    for (title, number) in [("a short", 2), ("c long", 1)] {
+        let app = harness.state_mut();
+        let track = app.library.tracks.iter_mut().find(|track| track.info.title == title).unwrap();
+        (track.info.album, track.info.track_number) = ("Night".to_owned(), Some(number));
+    }
+    harness.state_mut().apply(Action::OpenCollection(Collection::Album { name: "Night".to_owned(), artist: String::new() }));
+    harness.run_steps(4);
+    let view = harness.state().view;
+    assert_eq!(titles(&harness, view), ["c long", "a short"]);
+    assert!(harness.query_by_label("Sort: Recently added").is_none(), "albums have no sort menu");
 }
 
 #[test]

@@ -7,7 +7,7 @@ use eframe::egui::{
     vec2,
 };
 use amplo::{
-    library::{ALL_SONGS, Collection, LIKED_SONGS, Playlist, split_names},
+    library::{ALL_SONGS, Collection, LIKED_SONGS, Playlist, Sort, split_names},
     lyrics::Extra,
 };
 
@@ -750,7 +750,16 @@ impl App {
         let play = at(origin, section_width - 54.0, 18.0, 36.0, 36.0);
         let random = at(origin, section_width - 98.0, 18.0, 36.0, 36.0);
         let left = origin.x + 74.0;
-        let width = random.left() - 12.0 - left;
+        let mut text_right = random.left();
+        // An icon here, as the window is small. The menu marks the order chosen.
+        if self.view_is_sorted() {
+            let sort = at(origin, section_width - 142.0, 18.0, 36.0, 36.0);
+            let label = format!("Sort: {}", self.library.sort.label());
+            let response = IconButton::round(theme::SORT, 16.0, theme::TEXT).show(ui, sort, &label);
+            self.sort_menu(&response, actions);
+            text_right = sort.left();
+        }
+        let width = text_right - 12.0 - left;
         let title = spaced_line(ui, &playlist.name, theme::grotesk_bold(18.0), theme::TEXT, width, -0.18);
         let subtitle = line(ui, &meta, theme::inter(12.0), theme::SOFT, width);
         paint_two_lines(ui, left, origin.y + 36.0, 2.0, title, subtitle);
@@ -765,6 +774,49 @@ impl App {
         let border = origin.y + 70.5;
         let stroke = Stroke::new(1.0, theme::LINE);
         ui.painter().hline(origin.x + 14.0..=origin.x + section_width - 14.0, border, stroke);
+    }
+
+    /// Whether the shown list follows the sort menu. Albums keep their own order.
+    pub fn view_is_sorted(&self) -> bool {
+        self.library.playlists.get(self.view).is_some_and(Playlist::follows_sort)
+    }
+
+    /// The order of the song lists, ending at `right_center`. A click lists the other
+    /// orders. Returns where the button is.
+    pub fn draw_sort_button(&self, ui: &Ui, right_center: Pos2, height: f32, actions: &mut Vec<Action>) -> Rect {
+        let sort = self.library.sort;
+        let mut job = LayoutJob::default();
+        job.append("Sort by ", 0.0, TextFormat { font_id: theme::inter(13.0), color: theme::SOFT, ..TextFormat::default() });
+        job.append(sort.label(), 0.0, TextFormat { font_id: theme::inter(13.0), color: theme::TEXT, ..TextFormat::default() });
+        let text = ui.painter().layout_job(job);
+        const CHEVRON: f32 = 14.0;
+        let width = 14.0 + text.size().x + 6.0 + CHEVRON + 10.0;
+        let rect = Rect::from_min_size(pos2(right_center.x - width, right_center.y - height / 2.0), vec2(width, height));
+        let response = click_area(ui, rect, &format!("Sort: {}", sort.label()));
+        let fill = if response.hovered() { theme::ICON_HOVER } else { Color32::TRANSPARENT };
+        ui.painter().rect(rect, height / 2.0, fill, Stroke::new(1.0, theme::PILL_LINE), egui::StrokeKind::Inside);
+        let text_width = text.size().x;
+        paint_text(ui, Align2::LEFT_CENTER, pos2(rect.left() + 14.0, rect.center().y), text);
+        let chevron = Rect::from_center_size(
+            pos2(rect.left() + 14.0 + text_width + 6.0 + CHEVRON / 2.0, rect.center().y),
+            Vec2::splat(CHEVRON),
+        );
+        paint_icon(ui, chevron, theme::CHEVRON_DOWN, theme::CHEVRON);
+        self.sort_menu(&response, actions);
+        rect
+    }
+
+    /// The menu of orders, which opens from a click on `button`. The chosen one is marked.
+    fn sort_menu(&self, button: &egui::Response, actions: &mut Vec<Action>) {
+        let sort = self.library.sort;
+        egui::Popup::menu(button).show(|ui| {
+            roomy_menu(ui);
+            for choice in Sort::ALL {
+                if ui.add(egui::Button::selectable(choice == sort, choice.label())).clicked() {
+                    actions.push(Action::SetSort(choice));
+                }
+            }
+        });
     }
 
     /// Clicks on a song. A plain click plays it, Ctrl and Shift select as in a file manager,

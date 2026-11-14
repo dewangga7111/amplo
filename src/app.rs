@@ -17,7 +17,7 @@ use std::{
 use eframe::egui;
 use amplo::{
     audio::open_source,
-    library::{self, ALL_SONGS, Collection, LIKED_SONGS, Library, TrackInfo},
+    library::{self, ALL_SONGS, Collection, LIKED_SONGS, Library, Sort, TrackInfo},
     lyrics::{Extra, Lyrics},
     settings::Settings,
     spectrum::{Analyzer, SampleBuffer, Tap},
@@ -59,6 +59,13 @@ const NOTICE_SECONDS: f64 = 3.0;
 const PASTE_WAIT: Duration = Duration::from_secs(1);
 /// How often a lost audio output is opened again until a device answers.
 const REOPEN_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the output is compared with the default device of Windows.
+const DEVICE_CHECK_INTERVAL: Duration = Duration::from_secs(2);
+
+/// The default output device of Windows right now.
+fn default_device_id() -> Option<String> {
+    cpal::default_host().default_output_device().and_then(|device| device.id().ok()).map(|id| id.to_string())
+}
 
 /// The message with its causes, which rodio leaves out of its own text.
 fn error_chain(err: &dyn std::error::Error) -> String {
@@ -161,6 +168,8 @@ pub enum Action {
     CycleLyricsExtra,
     /// Shows the songs of an album, an artist, or a genre.
     OpenCollection(Collection),
+    /// Changes the order of every song list except albums.
+    SetSort(Sort),
     Expand,
     Minimize,
     ToggleLike,
@@ -225,6 +234,11 @@ pub struct App {
     /// device goes away. Also set when Windows picks another default device.
     pub audio_lost: Arc<AtomicBool>,
     last_reopen: Option<Instant>,
+    /// The default device when the output opened. After sleep, Windows can make another
+    /// device the default for a moment, such as while a monitor's speaker wakes up, and the
+    /// output can stay there after the default changes back. See [`App::check_output_device`].
+    pub sink_device: Option<String>,
+    last_device_check: Option<Instant>,
     /// One `Player` per track. Dropping it stops the track.
     pub player: Option<Player>,
     pub duration: Option<Duration>,
@@ -371,6 +385,8 @@ impl App {
             sink: None,
             audio_lost: Arc::new(AtomicBool::new(false)),
             last_reopen: None,
+            sink_device: None,
+            last_device_check: None,
             player: None,
             duration: None,
             seek_preview: None,
@@ -478,6 +494,10 @@ impl App {
                 }
                 ScanEvent::Finished { generation } if generation == self.generation => {
                     self.scanning = false;
+                    // Sorting by the tags waits for all of them, so the rows move only once.
+                    if self.library.sort_songs() {
+                        self.clear_selection_if_sorted();
+                    }
                     self.update_shown_collection();
                 }
                 _ => {}
@@ -522,6 +542,7 @@ impl App {
                 track.info = info.clone();
             }
         }
+        library.set_sort(self.settings.sort);
         // The album, artist, or genre shown stays, with the songs it has now.
         if let Some(collection) = self.library.shown_collection() {
             let songs = library.collection(collection);
@@ -712,11 +733,12 @@ impl App {
         }
     }
 
-    fn install_library(&mut self, library: Library, autoplay: bool, roots: Vec<PathBuf>, folder: Option<PathBuf>) {
+    fn install_library(&mut self, mut library: Library, autoplay: bool, roots: Vec<PathBuf>, folder: Option<PathBuf>) {
         if library.tracks.is_empty() {
             self.error = Some(NO_AUDIO.to_owned());
             return;
         }
+        library.set_sort(self.settings.sort);
         self.stop();
         self.view = ALL_SONGS;
         self.error = (library.missing_entries > 0)
@@ -871,8 +893,13 @@ impl App {
     /// Returns the sample rate and channel count of the decoded audio.
     fn start(&mut self, path: &Path, paused: bool) -> Result<(u32, u16), String> {
         let source = open_source(path)?;
+        // An output left on another device, as after sleep, opens again on the default one.
+        if self.sink.is_some() && default_device_id().is_some_and(|current| Some(current) != self.sink_device) {
+            self.sink = None;
+        }
         if self.sink.is_none() {
             self.sink = Some(self.open_sink()?);
+            self.sink_device = default_device_id();
         }
         let Some(sink) = &self.sink else {
             unreachable!("sink was opened above");
@@ -901,7 +928,11 @@ impl App {
 
     fn toggle(&mut self) {
         match &self.player {
-            Some(player) if player.is_paused() => player.play(),
+            Some(player) if player.is_paused() => {
+                player.play();
+                // The PC may have slept while the track was paused.
+                self.check_output_device(true);
+            }
             Some(player) => player.pause(),
             None => match &self.queue {
                 Some(queue) => self.play_at(queue.position),
@@ -984,6 +1015,23 @@ impl App {
         self.search.clear();
         self.minimized = true;
         self.spotify_open = false;
+    }
+
+    /// Changes the order of the song lists, and remembers it.
+    fn set_sort(&mut self, sort: Sort) {
+        self.settings.sort = sort;
+        self.save_settings();
+        if self.library.set_sort(sort) {
+            self.clear_selection_if_sorted();
+        }
+    }
+
+    /// The rows of a sorted list moved, so its selection would point at other songs.
+    fn clear_selection_if_sorted(&mut self) {
+        if self.library.playlists.get(self.view).is_some_and(library::Playlist::follows_sort) {
+            self.selected.clear();
+            self.select_anchor = None;
+        }
     }
 
     /// Songs found by the scan join the collection shown. Their tags come in after the song list.
@@ -1178,6 +1226,7 @@ impl App {
             Action::SaveLyrics => self.save_lyrics(),
             Action::CloseLyricsEditor => self.lyrics_editor = None,
             Action::OpenCollection(collection) => self.open_collection(collection),
+            Action::SetSort(sort) => self.set_sort(sort),
             Action::CycleLyricsExtra => {
                 let choices = self.lyric_extra_choices();
                 let current = choices.iter().position(|&choice| choice == self.lyric_extra()).unwrap_or(0);
@@ -1306,6 +1355,7 @@ impl App {
         }
         let resume = self.player.take().map(|player| (player.get_pos(), player.is_paused()));
         self.sink = Some(sink);
+        self.sink_device = default_device_id();
         let (Some((position, paused)), Some(track)) = (resume, self.current_track()) else { return };
         let path = self.library.tracks[track].path.clone();
         match self.start(&path, paused) {
@@ -1320,11 +1370,30 @@ impl App {
         }
     }
 
+    /// Marks the output as lost when it is not on the default device of Windows, so the next
+    /// update opens it there. The stream's own error does not come when the default changes
+    /// while the output opens, as it can after sleep. `now` checks at once, as before playing.
+    pub fn check_output_device(&mut self, now: bool) {
+        if self.sink.is_none() || (!now && self.last_device_check.is_some_and(|last| last.elapsed() < DEVICE_CHECK_INTERVAL)) {
+            return;
+        }
+        self.last_device_check = Some(Instant::now());
+        let current = default_device_id();
+        // No default at all is a missing device, which the stream reports itself.
+        if current.is_some() && current != self.sink_device {
+            self.audio_lost.store(true, Ordering::Relaxed);
+            self.ctx.request_repaint();
+        }
+    }
+
     /// Follows the playing audio. Runs while the window is minimized too.
     pub fn update_playback(&mut self, ctx: &egui::Context) {
         self.receive_scan_events();
         self.covers.poll(ctx);
         self.poll_spotify(ctx);
+        if self.is_playing() {
+            self.check_output_device(false);
+        }
         self.recover_audio(ctx);
         if self.player.as_ref().is_some_and(Player::empty) {
             self.advance();

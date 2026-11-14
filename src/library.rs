@@ -5,7 +5,7 @@ use std::{
     fs,
     ops::Range,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use lofty::{
@@ -41,24 +41,79 @@ pub struct TrackInfo {
 pub struct Track {
     pub path: PathBuf,
     pub info: TrackInfo,
+    /// When the file came into the folder. Windows sets a file's creation time when it is
+    /// copied or downloaded there, while the modified time stays from before.
+    pub added: Option<SystemTime>,
 }
 
 impl Track {
     /// Starts with the title and artist from the file name, until the tags have been read.
     pub fn from_path(path: PathBuf) -> Self {
         let (title, artist) = name_from_file(&path);
-        Self { path, info: TrackInfo { title, artist, ..TrackInfo::default() } }
+        let added = fs::metadata(&path).ok().and_then(|metadata| metadata.created().or_else(|_| metadata.modified()).ok());
+        Self { path, info: TrackInfo { title, artist, ..TrackInfo::default() }, added }
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// The order of every song list except albums, which keep their discs and track numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Sort {
+    /// The newest files first. In a playlist file, the songs added to it last come first.
+    #[default]
+    RecentlyAdded,
+    Title,
+    /// By artist, then album by album in track order.
+    Artist,
+    /// Album by album in track order.
+    Album,
+}
+
+impl Sort {
+    pub const ALL: [Self; 4] = [Self::RecentlyAdded, Self::Title, Self::Artist, Self::Album];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RecentlyAdded => "Recently added",
+            Self::Title => "Title",
+            Self::Artist => "Artist",
+            Self::Album => "Album",
+        }
+    }
+
+    /// The word saved in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::RecentlyAdded => "added",
+            Self::Title => "title",
+            Self::Artist => "artist",
+            Self::Album => "album",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sort| sort.key() == key)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct Playlist {
     pub name: String,
+    /// The songs in the order they show. See [`Library::sort`].
     pub tracks: Vec<usize>,
     /// The `.m3u` file. All Songs and Liked Songs have none, so songs cannot be added to them.
     pub path: Option<PathBuf>,
     /// Set for an album, artist, or genre opened from a song. It has no file either.
     pub collection: Option<Collection>,
+    /// The songs in the order of the `.m3u` file. Empty for lists without a file.
+    pub in_file: Vec<usize>,
+}
+
+impl Playlist {
+    /// An album keeps the order of its discs and track numbers. Every other list follows
+    /// the sort menu.
+    pub fn follows_sort(&self) -> bool {
+        !matches!(self.collection, Some(Collection::Album { .. }))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -68,6 +123,8 @@ pub struct Library {
     pub playlists: Vec<Playlist>,
     /// Playlist entries that point to a file outside the library, or to a missing file.
     pub missing_entries: usize,
+    /// The order of every song list except albums. See [`Library::set_sort`].
+    pub sort: Sort,
 }
 
 /// Splits the `Title - Artist` file name pattern. Anything else counts as a title only.
@@ -202,24 +259,21 @@ impl Collection {
 
 impl Library {
     /// The songs of a collection as a playlist. An album is in the order of its discs and
-    /// track numbers. An artist goes album by album in the same order, and a genre goes
-    /// artist by artist. Songs without a number come last in their album, by title.
+    /// track numbers, with songs without a number last, by title. An artist or a genre
+    /// follows the sort menu.
     pub fn collection(&self, collection: &Collection) -> Playlist {
         let mut tracks: Vec<usize> =
             (0..self.tracks.len()).filter(|&track| collection.contains(&self.tracks[track].info)).collect();
-        let in_album = |info: &TrackInfo| {
-            (info.disc_number.unwrap_or(1), info.track_number.is_none(), info.track_number, info.title.to_lowercase())
-        };
-        let album = |info: &TrackInfo| (info.album.is_empty(), info.album.to_lowercase());
         tracks.sort_by_cached_key(|&track| {
             let info = &self.tracks[track].info;
-            let artist = match collection {
-                Collection::Genre(_) => info.artist.to_lowercase(),
-                Collection::Album { .. } | Collection::Artist(_) => String::new(),
-            };
-            (artist, album(info), in_album(info))
+            (info.disc_number.unwrap_or(1), info.track_number.is_none(), info.track_number, info.title.to_lowercase())
         });
-        Playlist { name: collection.name().to_owned(), tracks, path: None, collection: Some(collection.clone()) }
+        let mut playlist =
+            Playlist { name: collection.name().to_owned(), tracks, collection: Some(collection.clone()), ..Playlist::default() };
+        if playlist.follows_sort() {
+            playlist.tracks = self.sorted(&playlist);
+        }
+        playlist
     }
 
     /// Shows a collection as the last playlist, in place of the one shown before. Returns
@@ -423,11 +477,12 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
 
     let mut library = Library {
         playlists: vec![
-            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None, collection: None },
-            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None, collection: None },
+            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None, collection: None, in_file: Vec::new() },
+            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None, collection: None, in_file: Vec::new() },
         ],
         tracks,
         missing_entries: 0,
+        sort: Sort::default(),
     };
     library.refresh_liked(liked);
 
@@ -447,9 +502,16 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
         library.missing_entries += entries.len() - found.len();
         // A new playlist has no songs yet. One whose songs are all missing stays hidden.
         if entries.is_empty() || !found.is_empty() {
-            library.playlists.push(Playlist { name: playlist_name(&file), tracks: found, path: Some(file), collection: None });
+            library.playlists.push(Playlist {
+                name: playlist_name(&file),
+                tracks: found.clone(),
+                path: Some(file),
+                collection: None,
+                in_file: found,
+            });
         }
     }
+    library.sort_songs();
     library
 }
 
@@ -458,6 +520,67 @@ impl Library {
         self.playlists[LIKED_SONGS].tracks = (0..self.tracks.len())
             .filter(|&index| liked.contains(&self.tracks[index].path))
             .collect();
+        self.sort_songs();
+    }
+
+    /// Puts every list that follows the sort in this order. Returns whether any changed.
+    pub fn set_sort(&mut self, sort: Sort) -> bool {
+        self.sort = sort;
+        self.sort_songs()
+    }
+
+    /// Puts every list that follows the sort in the order of [`Library::sort`] again, as after
+    /// the tags have been read. Returns whether any changed.
+    pub fn sort_songs(&mut self) -> bool {
+        let mut changed = false;
+        for index in 0..self.playlists.len() {
+            if !self.playlists[index].follows_sort() {
+                continue;
+            }
+            let tracks = self.sorted(&self.playlists[index]);
+            if tracks != self.playlists[index].tracks {
+                self.playlists[index].tracks = tracks;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// The songs of a list in the order of [`Library::sort`]. In a playlist file, the songs
+    /// added last are at its end, so they come first as the recently added ones. Elsewhere
+    /// the newest files come first. Equal songs keep the order of the file, or of the folder.
+    fn sorted(&self, playlist: &Playlist) -> Vec<usize> {
+        let base = if playlist.path.is_some() {
+            playlist.in_file.clone()
+        } else {
+            let mut tracks = playlist.tracks.clone();
+            tracks.sort_unstable();
+            tracks
+        };
+        let mut entries: Vec<(usize, usize)> = base.into_iter().enumerate().collect();
+        let lower = |text: &str| text.to_lowercase();
+        let in_album = |info: &TrackInfo| (info.disc_number.unwrap_or(1), info.track_number.is_none(), info.track_number);
+        // Empty names go last.
+        let name = |text: &str| (text.is_empty(), lower(text));
+        let info = |track: usize| &self.tracks[track].info;
+        match self.sort {
+            Sort::RecentlyAdded if playlist.path.is_some() => entries.reverse(),
+            Sort::RecentlyAdded => {
+                entries.sort_by_key(|&(position, track)| (std::cmp::Reverse(self.tracks[track].added), position));
+            }
+            Sort::Title => entries.sort_by_cached_key(|&(position, track)| {
+                (lower(&info(track).title), name(&info(track).artist), position)
+            }),
+            Sort::Artist => entries.sort_by_cached_key(|&(position, track)| {
+                let info = info(track);
+                (name(&info.artist), name(&info.album), in_album(info), lower(&info.title), position)
+            }),
+            Sort::Album => entries.sort_by_cached_key(|&(position, track)| {
+                let info = info(track);
+                (name(&info.album), in_album(info), lower(&info.title), position)
+            }),
+        }
+        entries.into_iter().map(|(_, track)| track).collect()
     }
 }
 
@@ -547,6 +670,7 @@ mod tests {
                 track_number: number,
                 ..TrackInfo::default()
             },
+            added: None,
         };
         let mut library = Library {
             tracks: vec![
@@ -560,6 +684,7 @@ mod tests {
             ],
             playlists: Vec::new(),
             missing_entries: 0,
+            sort: Sort::default(),
         };
         let key = Collection::album_of(&library.tracks[0].info).unwrap();
         let album = library.collection(&key);
@@ -595,7 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn artists_go_album_by_album_and_genres_artist_by_artist() {
+    fn artists_and_genres_list_their_songs_in_the_sort_order() {
         let song = |title: &str, artist: &str, album: &str, genre: &str, number: u32| Track {
             path: PathBuf::from(format!("{title}.flac")),
             info: TrackInfo {
@@ -606,6 +731,7 @@ mod tests {
                 track_number: Some(number),
                 ..TrackInfo::default()
             },
+            added: None,
         };
         let library = Library {
             tracks: vec![
@@ -617,6 +743,8 @@ mod tests {
             ],
             playlists: Vec::new(),
             missing_entries: 0,
+            // Artists and genres follow the sort menu.
+            sort: Sort::Artist,
         };
         let titles = |collection: Collection| -> Vec<String> {
             let playlist = library.collection(&collection);
@@ -626,6 +754,71 @@ mod tests {
         assert_eq!(titles(Collection::Artist("Mili".to_owned())), ["Alpha one", "Zeta one", "Zeta two", "Single"]);
         assert_eq!(titles(Collection::Artist("Yamato Kasai".to_owned())), ["Single"]);
         assert_eq!(titles(Collection::Genre("pop".to_owned())), ["Zeta one", "Zeta two", "Single", "Elsewhere"]);
+    }
+
+    #[test]
+    fn lists_follow_the_sort_except_albums() {
+        let song = |title: &str, artist: &str, album: &str, number: u32, added: u64| Track {
+            path: PathBuf::from(format!("{title}.flac")),
+            info: TrackInfo {
+                title: title.to_owned(),
+                artist: artist.to_owned(),
+                album: album.to_owned(),
+                track_number: Some(number),
+                ..TrackInfo::default()
+            },
+            added: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(added)),
+        };
+        let tracks = vec![
+            song("beta", "Zed", "Night", 2, 30),
+            song("Alpha", "", "Day", 1, 10),
+            song("gamma", "amy", "Night", 1, 20),
+            song("Delta", "Zed", "", 1, 40),
+        ];
+        let mut library = Library {
+            playlists: vec![
+                Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None, collection: None, in_file: Vec::new() },
+                Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None, collection: None, in_file: Vec::new() },
+                Playlist {
+                    name: "Mix".to_owned(),
+                    tracks: vec![2, 0, 3],
+                    path: Some(PathBuf::from("Mix.m3u")),
+                    in_file: vec![2, 0, 3],
+                    ..Playlist::default()
+                },
+                Playlist {
+                    name: "Night".to_owned(),
+                    tracks: vec![0, 2],
+                    collection: Some(Collection::Album { name: "Night".to_owned(), artist: String::new() }),
+                    ..Playlist::default()
+                },
+            ],
+            tracks,
+            missing_entries: 0,
+            sort: Sort::default(),
+        };
+        let titles = |library: &Library, index: usize| -> Vec<String> {
+            library.playlists[index].tracks.iter().map(|&track| library.tracks[track].info.title.clone()).collect()
+        };
+        assert!(library.sort_songs());
+        assert_eq!(titles(&library, ALL_SONGS), ["Delta", "beta", "gamma", "Alpha"], "newest first");
+        assert_eq!(titles(&library, 2), ["Delta", "beta", "gamma"], "the last songs added to the playlist first");
+        assert!(library.set_sort(Sort::Title));
+        assert_eq!(titles(&library, ALL_SONGS), ["Alpha", "beta", "Delta", "gamma"]);
+        assert_eq!(titles(&library, 2), ["beta", "Delta", "gamma"]);
+        assert!(library.set_sort(Sort::Artist));
+        assert_eq!(titles(&library, ALL_SONGS), ["gamma", "beta", "Delta", "Alpha"], "unknown artists last");
+        assert!(library.set_sort(Sort::Album));
+        assert_eq!(titles(&library, ALL_SONGS), ["Alpha", "gamma", "beta", "Delta"], "songs without an album last");
+        assert_eq!(titles(&library, 2), ["gamma", "beta", "Delta"]);
+        assert!(!library.set_sort(Sort::Album), "nothing changes the second time");
+        assert_eq!(titles(&library, 3), ["beta", "gamma"], "an album keeps its own order");
+
+        library.refresh_liked(&BTreeSet::from([PathBuf::from("beta.flac"), PathBuf::from("gamma.flac")]));
+        assert_eq!(titles(&library, LIKED_SONGS), ["gamma", "beta"], "Liked Songs follows the sort too");
+        library.set_sort(Sort::RecentlyAdded);
+        assert_eq!(titles(&library, 2), ["Delta", "beta", "gamma"], "the playlist's own order comes back");
+        assert_eq!(Sort::from_key(Sort::Artist.key()), Some(Sort::Artist));
     }
 
     #[test]

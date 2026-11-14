@@ -51,6 +51,7 @@ pub const PAUSE: ImageSource<'static> = include_image!("../assets/icons/pause.sv
 pub const PREVIOUS: ImageSource<'static> = include_image!("../assets/icons/prev.svg");
 pub const NEXT: ImageSource<'static> = include_image!("../assets/icons/next.svg");
 pub const SHUFFLE: ImageSource<'static> = include_image!("../assets/icons/shuffle.svg");
+pub const SORT: ImageSource<'static> = include_image!("../assets/icons/sort.svg");
 pub const REPEAT: ImageSource<'static> = include_image!("../assets/icons/repeat.svg");
 pub const HEART: ImageSource<'static> = include_image!("../assets/icons/heart.svg");
 pub const HEART_FILLED: ImageSource<'static> = include_image!("../assets/icons/heart-filled.svg");

@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeSet, fmt::Write as _, fs, io, path::PathBuf};
 
-use crate::lyrics::Extra;
+use crate::{library::Sort, lyrics::Extra};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
@@ -15,6 +15,8 @@ pub struct Settings {
     pub spotify_token: Option<String>,
     /// What shows under each lyric line when the lyrics file has it. `None` shows nothing.
     pub lyrics_extra: Option<Extra>,
+    /// The order of every song list except albums.
+    pub sort: Sort,
 }
 
 impl Default for Settings {
@@ -26,6 +28,7 @@ impl Default for Settings {
             spotify_client: None,
             spotify_token: None,
             lyrics_extra: Some(Extra::Romaji),
+            sort: Sort::default(),
         }
     }
 }
@@ -55,6 +58,11 @@ impl Settings {
                 Some(("lyrics_extra", "romaji")) => settings.lyrics_extra = Some(Extra::Romaji),
                 Some(("lyrics_extra", "translation")) => settings.lyrics_extra = Some(Extra::Translation),
                 Some(("lyrics_extra", "none")) => settings.lyrics_extra = None,
+                Some(("sort", value)) => {
+                    if let Some(sort) = Sort::from_key(value) {
+                        settings.sort = sort;
+                    }
+                }
                 _ => {}
             }
         }
@@ -82,6 +90,7 @@ impl Settings {
             None => "none",
         };
         let _ = writeln!(text, "lyrics_extra={extra}");
+        let _ = writeln!(text, "sort={}", self.sort.key());
         text
     }
 
@@ -112,6 +121,7 @@ mod tests {
             spotify_client: Some("0123abcd".to_owned()),
             spotify_token: Some("AQ-x_y".to_owned()),
             lyrics_extra: Some(Extra::Translation),
+            sort: Sort::Artist,
         };
         assert_eq!(Settings::parse(&settings.serialize()), settings);
         let settings = Settings { lyrics_extra: None, ..settings };
