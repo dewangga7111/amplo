@@ -18,7 +18,7 @@ use eframe::egui;
 use amplo::{
     audio::open_source,
     library::{self, ALL_SONGS, Collection, LIKED_SONGS, Library, Sort, TrackInfo},
-    lyrics::{Extra, Lyrics},
+    lyrics::{self, Extra, Lyrics},
     settings::Settings,
     spectrum::{Analyzer, SampleBuffer, Tap},
     watch::FolderWatcher,
@@ -1096,8 +1096,8 @@ impl App {
     fn edit_lyrics(&mut self) {
         let Some(track) = self.current_track() else { return };
         let track = &self.library.tracks[track];
-        let bytes = fs::read(track.path.with_extension("lrc")).unwrap_or_default();
-        let text = String::from_utf8_lossy(&bytes).trim_start_matches('\u{feff}').replace("\r\n", "\n");
+        let text = lyrics::text_for_track(&track.path).unwrap_or_default();
+        let text = text.trim_start_matches('\u{feff}').replace("\r\n", "\n");
         self.lyrics_editor = Some(LyricsEditor {
             track: track.path.clone(),
             title: track.info.title.clone(),

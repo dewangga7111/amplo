@@ -1,6 +1,8 @@
-//! Lyrics from `.lrc` files beside the audio files.
+//! Lyrics from `.lrc` files beside the audio files, or from the tags of the audio files.
 
 use std::{collections::BTreeMap, fs, path::Path, time::Duration};
+
+use lofty::{config::ParseOptions, file::TaggedFileExt, probe::Probe, tag::ItemKey};
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Line {
@@ -53,6 +55,28 @@ fn decode_base64(text: &str) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The text of the lyrics a track's tags have, such as the `LYRICS` tag of FLAC and Opus files,
+/// `USLT` in MP3 files and `©lyr` in M4A files. Synced lyrics in them are LRC text.
+pub fn embedded_text(track: &Path) -> Option<String> {
+    let options = ParseOptions::new().read_properties(false).read_cover_art(false);
+    let tagged = Probe::open(track).ok()?.options(options).guess_file_type().ok()?.read().ok()?;
+    tagged.tags().iter().find_map(|tag| {
+        [ItemKey::Lyrics, ItemKey::UnsyncLyrics]
+            .into_iter()
+            .filter_map(|key| tag.get_string(key))
+            .find(|text| !text.trim().is_empty())
+            .map(str::to_owned)
+    })
+}
+
+/// The text to edit for a track's lyrics: its `.lrc` file, or else the lyrics in its tags.
+pub fn text_for_track(track: &Path) -> Option<String> {
+    match fs::read(track.with_extension("lrc")) {
+        Ok(bytes) => Some(String::from_utf8_lossy(&bytes).into_owned()),
+        Err(_) => embedded_text(track),
+    }
+}
+
 /// Reads `[x-romaji:<ms>:<base64>]` or `[x-translation:<ms>:<base64>]`.
 fn extra_tag(text: &str) -> Option<(Extra, u64, String)> {
     let inner = text.strip_prefix('[')?.strip_suffix(']')?;
@@ -84,9 +108,13 @@ impl Line {
 }
 
 impl Lyrics {
+    /// The lyrics of a track: its `.lrc` file, or else the lyrics in its tags. The `.lrc` file
+    /// comes first, as amplo saves the lyrics the user writes there.
     pub fn for_track(track: &Path) -> Option<Self> {
-        let bytes = fs::read(track.with_extension("lrc")).ok()?;
-        Self::parse(&String::from_utf8_lossy(&bytes))
+        fs::read(track.with_extension("lrc"))
+            .ok()
+            .and_then(|bytes| Self::parse(&String::from_utf8_lossy(&bytes)))
+            .or_else(|| Self::parse(&embedded_text(track)?))
     }
 
     pub fn parse(text: &str) -> Option<Self> {
@@ -205,6 +233,61 @@ fn clean_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A WAV file of silence, with lyrics in an ID3v2 tag when there are some.
+    fn tagged_wav(path: &Path, lyrics: Option<&str>) {
+        let samples = 800_u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&8000_u32.to_le_bytes());
+        bytes.extend_from_slice(&16000_u32.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(samples * 2).to_le_bytes());
+        bytes.resize(bytes.len() + samples as usize * 2, 0);
+        fs::write(path, bytes).unwrap();
+        if let Some(lyrics) = lyrics {
+            use lofty::{
+                config::WriteOptions,
+                tag::{Accessor, Tag, TagExt, TagType},
+            };
+            let mut tag = Tag::new(TagType::Id3v2);
+            tag.set_title("Song".into());
+            tag.insert_text(ItemKey::UnsyncLyrics, lyrics.to_owned());
+            tag.save_to_path(path, WriteOptions::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn reads_lyrics_from_the_tags_when_there_is_no_lrc_file() {
+        let folder = std::env::temp_dir().join(format!("amplo-embedded-lyrics-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&folder);
+        fs::create_dir_all(&folder).unwrap();
+        let song = folder.join("song.wav");
+        let tagged = "[00:01.00]From the tag\n[00:02.00]Second line\n";
+        tagged_wav(&song, Some(tagged));
+        let lyrics = Lyrics::for_track(&song).unwrap();
+        assert!(lyrics.synced);
+        assert_eq!(lyrics.lines[0].text, "From the tag");
+        assert_eq!(text_for_track(&song).unwrap(), tagged);
+
+        // The .lrc file that the user can edit comes first.
+        fs::write(song.with_extension("lrc"), "[00:01.00]From the file\n").unwrap();
+        assert_eq!(Lyrics::for_track(&song).unwrap().lines[0].text, "From the file");
+        assert_eq!(text_for_track(&song).unwrap(), "[00:01.00]From the file\n");
+
+        let plain = folder.join("plain.wav");
+        tagged_wav(&plain, None);
+        assert!(Lyrics::for_track(&plain).is_none());
+        assert!(text_for_track(&plain).is_none());
+        fs::remove_dir_all(&folder).unwrap();
+    }
 
     #[test]
     fn parses_the_library_format_with_headers_and_voice_prefixes() {
