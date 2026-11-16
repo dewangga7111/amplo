@@ -106,6 +106,9 @@ pub struct Playlist {
     pub collection: Option<Collection>,
     /// The songs in the order of the `.m3u` file. Empty for lists without a file.
     pub in_file: Vec<usize>,
+    /// A picture beside the `.m3u` file with the same name, such as `Road Trip.jpg`. It shows
+    /// in place of the covers of the songs.
+    pub cover: Option<PathBuf>,
 }
 
 impl Playlist {
@@ -321,6 +324,75 @@ pub fn is_playlist(path: &Path) -> bool {
         .is_some_and(|ext| ext.eq_ignore_ascii_case("m3u") || ext.eq_ignore_ascii_case("m3u8"))
 }
 
+/// The kinds of picture a playlist cover can be. A new cover is saved as JPEG.
+const COVER_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+/// New covers are made no larger than this, which is sharp in the full layout and keeps the
+/// file small for the phone.
+const COVER_SIZE: u32 = 1000;
+
+fn is_picture(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| COVER_EXTENSIONS.iter().any(|cover| ext.eq_ignore_ascii_case(cover)))
+}
+
+/// The picture beside a playlist file with the same name, such as `Road Trip.jpg` for
+/// `Road Trip.m3u`. The Android app uses the same file.
+pub fn playlist_cover(playlist: &Path) -> Option<PathBuf> {
+    COVER_EXTENSIONS.iter().map(|ext| playlist.with_extension(ext)).find(|path| path.is_file())
+}
+
+/// Whether a picture is the cover of a playlist beside it, so changing it changes the library.
+pub fn is_playlist_cover(path: &Path) -> bool {
+    is_picture(path) && ["m3u", "m3u8"].iter().any(|ext| path.with_extension(ext).is_file())
+}
+
+/// Saves the picture at `image` as the cover of `playlist`: cropped to a square at its center,
+/// no larger than [`COVER_SIZE`], as a JPEG beside the playlist. Other covers it had go.
+pub fn set_playlist_cover(playlist: &Path, image: &Path) -> Result<PathBuf, String> {
+    let bytes = fs::read(image).map_err(|err| format!("Could not read the picture: {err}"))?;
+    let picture = image::load_from_memory(&bytes).map_err(|_| "This file is not a picture amplo can read.".to_owned())?;
+    let size = picture.width().min(picture.height()).min(COVER_SIZE).max(1);
+    let square = picture.resize_to_fill(size, size, image::imageops::FilterType::Lanczos3).into_rgb8();
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, 90)
+        .encode_image(&square)
+        .map_err(|err| format!("Could not make the cover: {err}"))?;
+
+    let target = playlist.with_extension("jpg");
+    // A temporary file first, so a failed write leaves the old cover as it was.
+    let temporary = playlist.with_extension("jpg.part");
+    fs::write(&temporary, &jpeg)
+        .and_then(|()| fs::rename(&temporary, &target))
+        .map_err(|err| {
+            let _ = fs::remove_file(&temporary);
+            format!("Could not save the cover: {err}")
+        })?;
+    for ext in COVER_EXTENSIONS.iter().filter(|&&ext| ext != "jpg") {
+        let other = playlist.with_extension(ext);
+        // Windows does not tell `x.JPG` from `x.jpg`, and the new cover must stay.
+        if other.is_file() && !same_file(&other, &target) {
+            let _ = fs::remove_file(other);
+        }
+    }
+    Ok(target)
+}
+
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => path_key(&a) == path_key(&b),
+        _ => false,
+    }
+}
+
+/// Deletes every cover of `playlist`, so it shows the covers of its songs again.
+pub fn remove_playlist_cover(playlist: &Path) -> Result<(), String> {
+    while let Some(cover) = playlist_cover(playlist) {
+        fs::remove_file(&cover).map_err(|err| format!("Could not remove the cover: {err}"))?;
+    }
+    Ok(())
+}
+
 /// Removes the symbols around names such as `!#SamsungMusic_favorites#!`.
 fn playlist_name(path: &Path) -> String {
     let stem = path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy();
@@ -477,8 +549,8 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
 
     let mut library = Library {
         playlists: vec![
-            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None, collection: None, in_file: Vec::new() },
-            Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None, collection: None, in_file: Vec::new() },
+            Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), ..Playlist::default() },
+            Playlist { name: "Liked Songs".to_owned(), ..Playlist::default() },
         ],
         tracks,
         missing_entries: 0,
@@ -505,6 +577,7 @@ pub fn load(paths: impl IntoIterator<Item = PathBuf>, liked: &BTreeSet<PathBuf>)
             library.playlists.push(Playlist {
                 name: playlist_name(&file),
                 tracks: found.clone(),
+                cover: playlist_cover(&file),
                 path: Some(file),
                 collection: None,
                 in_file: found,
@@ -777,8 +850,8 @@ mod tests {
         ];
         let mut library = Library {
             playlists: vec![
-                Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), path: None, collection: None, in_file: Vec::new() },
-                Playlist { name: "Liked Songs".to_owned(), tracks: Vec::new(), path: None, collection: None, in_file: Vec::new() },
+                Playlist { name: "All Songs".to_owned(), tracks: (0..tracks.len()).collect(), ..Playlist::default() },
+                Playlist { name: "Liked Songs".to_owned(), ..Playlist::default() },
                 Playlist {
                     name: "Mix".to_owned(),
                     tracks: vec![2, 0, 3],
@@ -838,6 +911,68 @@ mod tests {
         assert_eq!(after.unwrap(), "#EXTM3U\r\n#EXTINF:90,B\r\nb.mp3\r\n");
         assert_eq!(none.unwrap(), 0);
         assert_eq!(unchanged.unwrap(), "#EXTM3U\r\n#EXTINF:90,B\r\nb.mp3\r\n");
+    }
+
+    fn picture(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let image = image::RgbImage::from_fn(width, height, |x, _| image::Rgb([(x % 256) as u8, 40, 200]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image).write_to(&mut bytes, format).unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn saves_and_removes_a_playlist_cover() {
+        let root = std::env::temp_dir().join(format!("amplo-playlist-cover-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let playlist = root.join("Road Trip.m3u");
+        fs::write(&playlist, "#EXTM3U\r\n").unwrap();
+        fs::write(root.join("Road Trip.png"), picture(8, 8, image::ImageFormat::Png)).unwrap();
+        let wide = root.join("photo.png");
+        fs::write(&wide, picture(1600, 1200, image::ImageFormat::Png)).unwrap();
+        fs::write(root.join("notes.txt"), "not a picture").unwrap();
+
+        let old = playlist_cover(&playlist);
+        let png_counts = is_playlist_cover(&root.join("Road Trip.png"));
+        let photo_counts = is_playlist_cover(&wide);
+        let saved = set_playlist_cover(&playlist, &wide);
+        let cover = playlist_cover(&playlist);
+        let png_left = root.join("Road Trip.png").exists();
+        let size = image::image_dimensions(root.join("Road Trip.jpg"));
+        let bad = set_playlist_cover(&playlist, &root.join("notes.txt"));
+        let after_bad = playlist_cover(&playlist);
+        let removed = remove_playlist_cover(&playlist);
+        let cover_after = playlist_cover(&playlist);
+        let playlist_left = playlist.exists();
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(old, Some(root.join("Road Trip.png")));
+        assert!(png_counts);
+        assert!(!photo_counts, "a picture without a playlist of its name is no cover");
+        assert_eq!(saved.unwrap(), root.join("Road Trip.jpg"));
+        assert_eq!(cover, Some(root.join("Road Trip.jpg")));
+        assert!(!png_left, "the old cover goes");
+        assert_eq!(size.unwrap(), (1000, 1000), "cropped to a square no larger than 1000 pixels");
+        assert_eq!(bad.unwrap_err(), "This file is not a picture amplo can read.");
+        assert_eq!(after_bad, Some(root.join("Road Trip.jpg")), "a failed change keeps the cover");
+        assert!(removed.is_ok());
+        assert_eq!(cover_after, None);
+        assert!(playlist_left);
+    }
+
+    #[test]
+    fn a_small_picture_keeps_its_size() {
+        let root = std::env::temp_dir().join(format!("amplo-small-cover-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let playlist = root.join("Mix.m3u8");
+        fs::write(&playlist, "#EXTM3U\r\n").unwrap();
+        let small = root.join("small.jpg");
+        fs::write(&small, picture(300, 500, image::ImageFormat::Jpeg)).unwrap();
+        let saved = set_playlist_cover(&playlist, &small);
+        let size = image::image_dimensions(root.join("Mix.jpg"));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(saved.unwrap(), root.join("Mix.jpg"));
+        assert_eq!(size.unwrap(), (300, 300));
     }
 
     #[test]

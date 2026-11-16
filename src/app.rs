@@ -158,6 +158,10 @@ pub enum Action {
     AddToPlaylist(usize),
     /// Takes the selected songs out of the shown playlist.
     RemoveFromPlaylist,
+    /// Asks for a picture and makes it the cover of the playlist at this index.
+    ChooseCover(usize),
+    /// Deletes the cover of the playlist at this index, so it shows the covers of its songs.
+    RemoveCover(usize),
     /// Saves the text on the clipboard as the lyrics of the song that plays.
     PasteLyrics,
     /// Opens the form that writes or changes the lyrics of the song that plays.
@@ -543,6 +547,10 @@ impl App {
             }
         }
         library.set_sort(self.settings.sort);
+        // A cover can change in its file while its path stays the same.
+        for cover in self.library.playlists.iter().chain(&library.playlists).filter_map(|playlist| playlist.cover.as_ref()) {
+            self.covers.forget(cover);
+        }
         // The album, artist, or genre shown stays, with the songs it has now.
         if let Some(collection) = self.library.shown_collection() {
             let songs = library.collection(collection);
@@ -1153,6 +1161,32 @@ impl App {
         self.save_settings();
     }
 
+    fn choose_cover(&mut self, index: usize) {
+        let Some(playlist) = self.library.playlists.get(index).and_then(|playlist| playlist.path.clone()) else { return };
+        let Some(image) = rfd::FileDialog::new()
+            .set_title("Choose a cover")
+            .add_filter("Pictures", &["jpg", "jpeg", "png", "webp"])
+            .pick_file()
+        else {
+            return;
+        };
+        match library::set_playlist_cover(&playlist, &image) {
+            Ok(cover) => {
+                self.covers.forget(&cover);
+                self.load_library(self.roots.clone(), LoadKind::Refresh);
+            }
+            Err(err) => self.error = Some(err),
+        }
+    }
+
+    fn remove_cover(&mut self, index: usize) {
+        let Some(playlist) = self.library.playlists.get(index).and_then(|playlist| playlist.path.clone()) else { return };
+        match library::remove_playlist_cover(&playlist) {
+            Ok(()) => self.load_library(self.roots.clone(), LoadKind::Refresh),
+            Err(err) => self.error = Some(err),
+        }
+    }
+
     fn open_folder(&mut self) {
         if let Some(folder) = rfd::FileDialog::new().pick_folder() {
             let roots = vec![folder.clone()];
@@ -1207,6 +1241,8 @@ impl App {
                 self.new_playlist = Some(NewPlaylist { songs, wants_focus: true, ..NewPlaylist::default() });
             }
             Action::CreatePlaylist => self.create_playlist(),
+            Action::ChooseCover(index) => self.choose_cover(index),
+            Action::RemoveCover(index) => self.remove_cover(index),
             Action::Select(row, how) => self.select(row, how),
             Action::SelectAll => {
                 self.selected = self.visible_rows().into_iter().collect();

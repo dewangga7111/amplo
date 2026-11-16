@@ -581,17 +581,11 @@ impl App {
         if response.clicked() {
             actions.push(Action::OpenPlaylist(index));
         }
+        self.playlist_menu(&response, index, actions);
 
         let center_y = rect.center().y;
         let cover = Rect::from_center_size(pos2(rect.left() + 22.0, center_y), Vec2::splat(28.0));
-        let first_track = self.library.playlists[index].tracks.first().copied();
-        match first_track {
-            Some(track) => {
-                let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
-                paint_texture(ui, cover, texture, 6);
-            }
-            None => paint_empty_cover(ui, cover, 6.0),
-        }
+        self.paint_playlist_cover(ui, cover, index, 6);
 
         let text_left = cover.right() + 10.0;
         let reserved = if is_playing { 20.0 } else { 0.0 };
@@ -723,8 +717,17 @@ impl App {
     }
 
     fn draw_list_header(&mut self, ui: &mut Ui, origin: Pos2, playlist: &Playlist, actions: &mut Vec<Action>) {
-        // Four covers in a square with rounded outer corners. Short playlists repeat theirs.
-        for index in 0..4 {
+        let art = at(origin, 18.0, 14.0, 44.0, 44.0);
+        // A playlist's own cover, or four covers in a square with rounded outer corners. Short
+        // playlists repeat theirs.
+        let tiles = if let Some(cover) = &playlist.cover {
+            let texture = self.covers.texture(ui.ctx(), cover);
+            paint_texture(ui, art, texture, 8);
+            0
+        } else {
+            4
+        };
+        for index in 0..tiles {
             let track = playlist.tracks[index % playlist.tracks.len()];
             let x = 18.0 + (index % 2) as f32 * 22.0;
             let y = 14.0 + (index / 2) as f32 * 22.0;
@@ -737,6 +740,7 @@ impl App {
             let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
             paint_texture(ui, at(origin, x, y, 22.0, 22.0), texture, radius);
         }
+        self.cover_editor(ui, art, egui::Id::unique("list-cover"), 8, actions);
 
         let seconds: f32 = playlist
             .tracks
@@ -837,6 +841,59 @@ impl App {
             actions.push(Action::Select(row, Selection::Only));
         }
         response.context_menu(|ui| self.song_menu(ui, row, actions));
+    }
+
+    /// The cover a playlist shows in a list of playlists: its own picture, or else the cover
+    /// of its first song.
+    pub fn paint_playlist_cover(&mut self, ui: &Ui, rect: Rect, index: usize, radius: u8) {
+        let playlist = &self.library.playlists[index];
+        let path = match (&playlist.cover, playlist.tracks.first()) {
+            (Some(cover), _) => cover.clone(),
+            (None, Some(&track)) => self.library.tracks[track].path.clone(),
+            (None, None) => return paint_empty_cover(ui, rect, f32::from(radius)),
+        };
+        let texture = self.covers.texture(ui.ctx(), &path);
+        paint_texture(ui, rect, texture, radius);
+    }
+
+    /// Lets the user change the cover of a playlist file at [rect]. On hover, a dark layer
+    /// with a pencil shows. A click opens the file dialog. The right-click menu can also
+    /// remove the cover.
+    pub fn cover_editor(&self, ui: &Ui, rect: Rect, id: egui::Id, radius: u8, actions: &mut Vec<Action>) {
+        let index = self.view;
+        let Some(playlist) = self.library.playlists.get(index).filter(|playlist| playlist.path.is_some()) else {
+            return;
+        };
+        let label = format!("Change the cover of {}", playlist.name);
+        let response = ui.interact(rect, id, egui::Sense::click()).on_hover_cursor(egui::CursorIcon::PointingHand);
+        response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &label));
+        if response.hovered() {
+            ui.painter().rect_filled(rect, radius, Color32::from_black_alpha(110));
+            let side = (rect.width() * 0.36).clamp(16.0, 36.0);
+            paint_icon(ui, Rect::from_center_size(rect.center(), Vec2::splat(side)), theme::PENCIL, theme::TEXT);
+        }
+        if response.clicked() {
+            actions.push(Action::ChooseCover(index));
+        }
+        self.playlist_menu(&response, index, actions);
+    }
+
+    /// The right-click menu of a playlist file, which changes its cover.
+    pub fn playlist_menu(&self, response: &egui::Response, index: usize, actions: &mut Vec<Action>) {
+        let Some(playlist) = self.library.playlists.get(index) else { return };
+        if playlist.path.is_none() {
+            return;
+        }
+        let has_cover = playlist.cover.is_some();
+        response.context_menu(|ui| {
+            roomy_menu(ui);
+            if ui.button("Change cover…").clicked() {
+                actions.push(Action::ChooseCover(index));
+            }
+            if has_cover && ui.button("Remove cover").clicked() {
+                actions.push(Action::RemoveCover(index));
+            }
+        });
     }
 
     fn song_menu(&self, ui: &mut Ui, row: usize, actions: &mut Vec<Action>) {

@@ -13,7 +13,7 @@ use crate::{
     spotify_page::SpotifyAction,
     theme,
     ui::{
-        LyricStyle, UNKNOWN_TIME, artist_links, artist_name, draw_empty_playlist, row_artist_links, paint_empty_cover, plural_songs,
+        LyricStyle, UNKNOWN_TIME, artist_links, artist_name, draw_empty_playlist, row_artist_links, plural_songs,
         title_bar_drag,
     },
     widgets::{
@@ -301,16 +301,11 @@ impl App {
         if response.clicked() {
             actions.push(Action::OpenPlaylist(index));
         }
+        self.playlist_menu(&response, index, actions);
 
         let center_y = rect.center().y;
         let cover = Rect::from_center_size(pos2(rect.left() + 29.0, center_y), Vec2::splat(38.0));
-        match playlist.tracks.first() {
-            Some(&track) => {
-                let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
-                paint_texture(ui, cover, texture, 8);
-            }
-            None => paint_empty_cover(ui, cover, 8.0),
-        }
+        self.paint_playlist_cover(ui, cover, index, 8);
 
         let text_left = cover.right() + 12.0;
         let reserved = if is_playing { 24.0 } else { 0.0 };
@@ -374,9 +369,14 @@ impl App {
         let mosaic = at(origin, PAD_X, HEADER_TOP, MOSAIC, MOSAIC);
         paint_shadow(ui, mosaic, 16, 20, 50, 115);
         let half = MOSAIC / 2.0;
-        // An album has one cover, which fills the whole square. An artist or a genre shows the
-        // covers of its first albums.
+        // A playlist with its own cover and an album have one picture, which fills the whole
+        // square. An artist or a genre shows the covers of its first albums.
         let covers: Vec<usize> = match &playlist.collection {
+            _ if playlist.cover.is_some() => {
+                let texture = self.covers.texture(ui.ctx(), playlist.cover.as_ref().unwrap());
+                paint_texture(ui, mosaic, texture, 16);
+                Vec::new()
+            }
             Some(Collection::Album { .. }) => {
                 let texture = self.covers.texture(ui.ctx(), &self.library.tracks[playlist.tracks[0]].path);
                 paint_texture(ui, mosaic, texture, 16);
@@ -412,6 +412,7 @@ impl App {
             let texture = self.covers.texture(ui.ctx(), &self.library.tracks[track].path);
             paint_texture(ui, tile, texture, radius);
         }
+        self.cover_editor(ui, mosaic, egui::Id::unique("full-list-cover"), 16, actions);
 
         // The text sits on the bottom of the covers, as the design's `align-items: flex-end`.
         let text_left = mosaic.right() + 28.0;

@@ -634,6 +634,40 @@ fn removing_the_playing_file_stops_it_with_a_message() {
     assert!(harness.state().error.as_deref().unwrap().contains("c long"));
 }
 
+#[test]
+fn a_playlist_cover_shows_and_can_be_removed() {
+    let folder = TestFolder::new("playlist-cover");
+    let cover = folder.0.join("Mix.png");
+    image::RgbImage::from_pixel(4, 4, image::Rgb([200, 40, 90])).save(&cover).unwrap();
+    let mut harness = harness_for(&folder);
+    let mix = harness.state().library.playlists.iter().position(|playlist| playlist.name == "Mix").unwrap();
+    assert_eq!(harness.state().library.playlists[mix].cover.as_deref(), Some(cover.as_path()));
+
+    harness.get_by_label("Mix").click_secondary();
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Change cover…").is_some());
+    harness.get_by_label("Remove cover").click();
+    wait_until(&mut harness, "a rescan without the cover", |app| {
+        app.library.playlists.iter().any(|playlist| playlist.name == "Mix" && playlist.cover.is_none())
+    });
+    assert!(!cover.exists());
+
+    // Without a cover, the menu can only set one.
+    harness.get_by_label("Mix").click_secondary();
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Change cover…").is_some());
+    assert!(harness.query_by_label("Remove cover").is_none());
+    harness.key_press(egui::Key::Escape);
+
+    // The cover in the header of a playlist file opens the file dialog. All Songs has no file.
+    harness.state_mut().apply(Action::OpenPlaylist(mix));
+    harness.run_steps(4);
+    assert!(harness.query_by_label("Change the cover of Mix").is_some());
+    harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
+    harness.run_steps(4);
+    assert!(harness.query_by_label_contains("Change the cover").is_none());
+}
+
 /// Saves pictures of each screen, to compare with the design by eye. Set `AMPLO_RENDER_DIR`
 /// for the output and `AMPLO_RENDER_LIBRARY` for a real music folder. Stays silent at volume 0.
 #[test]
@@ -643,6 +677,11 @@ fn render_screens() {
     fs::create_dir_all(&output).unwrap();
     let folder = TestFolder::new("render");
     let library = std::env::var_os("AMPLO_RENDER_LIBRARY").map_or_else(|| folder.0.clone(), PathBuf::from);
+    // A cover of its own for the test playlist. A real music folder stays as it is.
+    if library == folder.0 {
+        let cover = image::RgbImage::from_fn(600, 600, |x, y| image::Rgb([(x * 255 / 600) as u8, 90, (y * 255 / 600) as u8]));
+        cover.save(folder.0.join("Mix.jpg")).unwrap();
+    }
 
     let mut harness = Harness::builder()
         .with_size(WINDOW_SIZE)
@@ -738,7 +777,7 @@ fn render_screens() {
     }
     // Only in memory, so a real music folder gets no new files.
     harness.state_mut().apply(Action::Minimize);
-    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), path: None, collection: None, in_file: Vec::new() };
+    let empty = amplo::library::Playlist { name: "Road Trip".to_owned(), tracks: Vec::new(), ..amplo::library::Playlist::default() };
     harness.state_mut().library.playlists.push(empty);
     let empty = harness.state().library.playlists.len() - 1;
     harness.state_mut().apply(Action::OpenPlaylist(empty));
@@ -751,6 +790,9 @@ fn render_screens() {
     let playlists = harness.state().library.playlists.len();
     harness.state_mut().apply(Action::OpenPlaylist(playlists - 1));
     settle(&mut harness, "playlist");
+    harness.get_by_label("Change the cover of Mix").hover();
+    settle(&mut harness, "playlist-cover-hover");
+    harness.input_mut().events.push(egui::Event::PointerGone);
 
     // The full layout at the design's size, and at a maximized 1920 by 1080 screen at 125 %.
     for (size, suffix) in [(egui::vec2(1280.0, 780.0), ""), (egui::vec2(1536.0, 824.0), "-wide")] {
@@ -758,6 +800,15 @@ fn render_screens() {
         harness.state_mut().full = true;
         harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
         settle(&mut harness, &format!("full-list{suffix}"));
+        if suffix.is_empty() {
+            harness.state_mut().apply(Action::OpenPlaylist(playlists - 1));
+            harness.run_steps(2);
+            harness.get_by_label("Change the cover of Mix").hover();
+            settle(&mut harness, "full-cover-hover");
+            harness.input_mut().events.push(egui::Event::PointerGone);
+            harness.state_mut().apply(Action::OpenPlaylist(ALL_SONGS));
+            harness.run_steps(2);
+        }
         if suffix.is_empty() {
             harness.state_mut().apply(Action::SetSort(Sort::RecentlyAdded));
             harness.run_steps(2);

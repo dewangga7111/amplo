@@ -89,8 +89,16 @@ fn run_worker(requests: &Receiver<Request>, results: &Sender<Loaded>, ctx: &egui
     }
 }
 
-/// The encoded front cover from the file's tags, or else the first picture they have.
+/// The encoded front cover from the file's tags, or else the first picture they have. A
+/// picture file, such as the cover of a playlist, is its own cover.
 pub fn cover_bytes(path: &Path) -> Option<Vec<u8>> {
+    let is_picture = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ["jpg", "jpeg", "png", "webp"].iter().any(|picture| ext.eq_ignore_ascii_case(picture)));
+    if is_picture {
+        return std::fs::read(path).ok();
+    }
     let tagged = Probe::open(path).ok()?.guess_file_type().ok()?.read().ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     let picture = tag
@@ -202,6 +210,14 @@ impl Covers {
             Some(Slot::Ready(texture)) => LargeCover::Ready(texture.id(), texture.size_vec2()),
             Some(Slot::Missing) => LargeCover::Missing,
             _ => LargeCover::Loading,
+        }
+    }
+
+    /// Loads the cover at `path` again the next time it shows, as its file has changed.
+    pub fn forget(&mut self, path: &Path) {
+        self.slots.remove(path);
+        if self.large.as_ref().is_some_and(|(large, _)| large == path) {
+            self.large = None;
         }
     }
 

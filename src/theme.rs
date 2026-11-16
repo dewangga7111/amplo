@@ -66,6 +66,7 @@ pub const DISC: ImageSource<'static> = include_image!("../assets/icons/disc.svg"
 pub const FOLDER: ImageSource<'static> = include_image!("../assets/icons/folder.svg");
 pub const CLOUD: ImageSource<'static> = include_image!("../assets/icons/cloud.svg");
 pub const CHECK: ImageSource<'static> = include_image!("../assets/icons/check.svg");
+pub const PENCIL: ImageSource<'static> = include_image!("../assets/icons/pencil.svg");
 
 const FONTS: [(&str, &[u8]); 6] = [
     ("inter", include_bytes!("../assets/fonts/Inter-Regular.ttf")),

@@ -12,14 +12,17 @@ use notify::{
     event::{ModifyKind, RenameMode},
 };
 
-use crate::{audio::is_audio, library::is_playlist};
+use crate::{
+    audio::is_audio,
+    library::{is_playlist, is_playlist_cover},
+};
 
 /// Copying a folder or downloading a file gives many events. The rescan waits for this
 /// much quiet, so it runs once and sees finished files.
 const QUIET_TIME: Duration = Duration::from_millis(1500);
 
 fn is_library_file(path: &Path) -> bool {
-    is_audio(path) || is_playlist(path)
+    is_audio(path) || is_playlist(path) || is_playlist_cover(path)
 }
 
 /// Decides if an event can change the library. Windows also reports folders as modified
@@ -94,6 +97,21 @@ mod tests {
         assert!(!affects_library(&event(write, "x/song.lrc")));
         assert!(!affects_library(&event(write, "x")), "a folder's own modify event");
         assert!(!affects_library(&event(EventKind::Access(notify::event::AccessKind::Any), "x/song.mp3")));
+    }
+
+    #[test]
+    fn a_playlist_cover_counts() {
+        let root = std::env::temp_dir().join(format!("amplo-watch-cover-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("Mix.m3u"), "#EXTM3U
+").unwrap();
+        let write = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        let cover = affects_library(&event(write, root.join("Mix.jpg").to_str().unwrap()));
+        let other = affects_library(&event(write, root.join("folder.jpg").to_str().unwrap()));
+        fs::remove_dir_all(&root).unwrap();
+
+        assert!(cover, "a picture with the name of a playlist is its cover");
+        assert!(!other);
     }
 
     #[test]
