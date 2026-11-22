@@ -223,7 +223,11 @@ impl App {
         heading(ui, "PLAYLISTS", playlists_top + 14.0);
         let add = Rect::from_min_size(pos2(left + width - 4.0 - 28.0, playlists_top), Vec2::splat(28.0));
         let open = add.translate(vec2(-32.0, 0.0));
+        let phone = open.translate(vec2(-32.0, 0.0));
         let button = |icon| IconButton { icon, icon_size: 16.0, color: theme::SOFT, radius: 8.0 };
+        if button(theme::PHONE).show(ui, phone, "Sync with phone").clicked() {
+            actions.push(Action::OpenSync);
+        }
         if button(theme::FOLDER).show(ui, open, "Open music folder").clicked() {
             actions.push(Action::OpenFolder);
         }

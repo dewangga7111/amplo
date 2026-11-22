@@ -376,6 +376,96 @@ fn draw_new_playlist(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Actio
     }
 }
 
+/// Pairs phones and lets them sync with the music folder.
+fn draw_sync(app: &mut App, ctx: &egui::Context, actions: &mut Vec<Action>) {
+    if !app.sync_open {
+        return;
+    }
+    let frame = egui::Frame::new()
+        .fill(theme::PANEL)
+        .stroke(Stroke::new(1.0, theme::PILL_LINE))
+        .corner_radius(14)
+        .inner_margin(22);
+    let text = |text: &str, size: f32, color: Color32| egui::RichText::new(text).font(theme::inter(size)).color(color);
+    let modal = egui::Modal::new(egui::Id::unique("sync"))
+        .backdrop_color(Color32::from_black_alpha(150))
+        .frame(frame)
+        .show(ctx, |ui| {
+            ui.set_width(340.0);
+            ui.label(egui::RichText::new("Sync with phone").font(theme::grotesk_semibold(18.0)).color(theme::TEXT));
+            ui.add_space(8.0);
+            ui.label(text(
+                "In amplo on the phone, open the menu and tap Sync with computer. The phone and this computer must be on the same Wi-Fi. Songs and playlists that one side does not have are copied to it. Nothing is deleted.",
+                13.0,
+                theme::MUTED,
+            ));
+            ui.add_space(14.0);
+            let mut on = app.settings.sync;
+            let toggle = egui::Checkbox::new(&mut on, text("Let phones sync with this computer", 14.0, theme::TEXT));
+            if ui.add(toggle).changed() {
+                actions.push(Action::SetSync(on));
+            }
+            if let Some(error) = &app.sync_error {
+                ui.add_space(8.0);
+                ui.label(text(error, 12.0, theme::WARNING));
+            }
+            if let Some(server) = &app.sync {
+                ui.add_space(16.0);
+                ui.label(egui::RichText::new("PAIRING CODE").font(theme::inter_semibold(10.0)).color(theme::MUTED));
+                let code = server.code();
+                let shown = format!("{} {}", &code[..3], &code[3..]);
+                ui.label(egui::RichText::new(shown).font(theme::grotesk_semibold(30.0)).color(theme::ACCENT));
+                ui.add_space(6.0);
+                ui.label(text("A phone asks for this code once. Windows can ask to let amplo use private networks: allow it.", 12.0, theme::MUTED));
+                ui.add_space(10.0);
+                if let Some(address) = app.sync_address {
+                    let line = format!("This computer: {address}");
+                    ui.label(egui::RichText::new(line).font(theme::mono(12.0)).color(theme::SOFT));
+                }
+                match &app.settings.folder {
+                    Some(folder) => {
+                        let line = format!("Music folder: {}", folder.display());
+                        ui.label(egui::RichText::new(line).font(theme::mono(12.0)).color(theme::SOFT));
+                    }
+                    None => {
+                        ui.label(text("Open a music folder first. Phones sync with it.", 12.0, theme::WARNING));
+                    }
+                }
+            }
+
+            ui.add_space(18.0);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let close = egui::Button::new(
+                    egui::RichText::new("Done").font(theme::inter_semibold(13.0)).color(theme::ON_ACCENT),
+                )
+                .fill(theme::ACCENT)
+                .corner_radius(8)
+                .min_size(vec2(76.0, 34.0));
+                let closed = ui.add(close).clicked();
+                let phones = app.settings.sync_keys.len();
+                if phones > 0 {
+                    ui.add_space(4.0);
+                    let label = if phones == 1 { "Forget the paired phone".to_owned() } else { format!("Forget {phones} paired phones") };
+                    let forget = egui::Button::new(
+                        egui::RichText::new(label).font(theme::inter_semibold(13.0)).color(theme::SOFT),
+                    )
+                    .fill(Color32::TRANSPARENT)
+                    .stroke(Stroke::new(1.0, theme::PILL_LINE))
+                    .corner_radius(8)
+                    .min_size(vec2(76.0, 34.0));
+                    if ui.add(forget).clicked() {
+                        actions.push(Action::ForgetPhones);
+                    }
+                }
+                closed
+            })
+            .inner
+        });
+    if modal.inner || modal.should_close() {
+        actions.push(Action::CloseSync);
+    }
+}
+
 pub fn plural_songs(count: usize) -> String {
     if count == 1 { "1 song".to_owned() } else { format!("{count} songs") }
 }
@@ -440,6 +530,7 @@ impl App {
         }
         draw_new_playlist(self, ui.ctx(), &mut actions);
         draw_lyrics_editor(self, ui.ctx(), &mut actions);
+        draw_sync(self, ui.ctx(), &mut actions);
 
         for action in actions {
             self.apply(action);
@@ -534,7 +625,11 @@ impl App {
         paint_text(ui, Align2::LEFT_CENTER, pos2(rect.left() + 16.0, rect.top() + 24.0), heading);
         let add = at(rect.min, 165.0, 12.0, 24.0, 24.0);
         let open = add.translate(vec2(-28.0, 0.0));
+        let phone = open.translate(vec2(-28.0, 0.0));
         let button = |icon| IconButton { icon, icon_size: 14.0, color: theme::SOFT, radius: 6.0 };
+        if button(theme::PHONE).show(ui, phone, "Sync with phone").clicked() {
+            actions.push(Action::OpenSync);
+        }
         if button(theme::FOLDER).show(ui, open, "Open music folder").clicked() {
             actions.push(Action::OpenFolder);
         }

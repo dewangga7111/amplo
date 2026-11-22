@@ -4,6 +4,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet, hash_map::RandomState},
     fs,
     hash::{BuildHasher, Hasher},
+    net::{IpAddr, Ipv4Addr},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -19,8 +20,9 @@ use amplo::{
     audio::open_source,
     library::{self, ALL_SONGS, Collection, LIKED_SONGS, Library, Sort, TrackInfo},
     lyrics::{self, Extra, Lyrics},
-    settings::Settings,
+    settings::{SavedQueue, Settings},
     spectrum::{Analyzer, SampleBuffer, Tap},
+    sync::{self, SyncEvent, SyncServer},
     watch::FolderWatcher,
 };
 use rodio::{
@@ -53,6 +55,8 @@ const RESTART_AFTER: Duration = Duration::from_secs(3);
 const NO_AUDIO: &str = "No audio files found in that folder.";
 /// Shown while the audio output cannot be opened again, for example right after sleep.
 const NO_OUTPUT: &str = "No audio output";
+/// How often the queue file is written while music plays, so a crash loses little.
+const SAVE_QUEUE_EVERY: Duration = Duration::from_secs(15);
 /// How long a confirmation stays in the title bar.
 const NOTICE_SECONDS: f64 = 3.0;
 /// How long the app waits for the clipboard text after asking for it.
@@ -183,6 +187,13 @@ pub enum Action {
     Seek(f32),
     SaveSettings,
     Spotify(SpotifyAction),
+    /// Shows the window that pairs phones and lets them sync.
+    OpenSync,
+    CloseSync,
+    /// Lets phones sync with this computer, or stops it.
+    SetSync(bool),
+    /// Unpairs every phone.
+    ForgetPhones,
 }
 
 /// What a finished library scan is for.
@@ -278,6 +289,18 @@ pub struct App {
     pub spotify: SpotifyPage,
     /// True while the full layout shows the Spotify page in place of a playlist.
     pub spotify_open: bool,
+    /// Answers phones while sync is on.
+    pub sync: Option<SyncServer>,
+    sync_sender: Sender<SyncEvent>,
+    sync_events: Receiver<SyncEvent>,
+    /// The queue of the last run, until the library is read and it can come back.
+    saved_queue: Option<SavedQueue>,
+    queue_saved_at: Option<Instant>,
+    /// The address of this computer on the network, for a phone that cannot find it.
+    pub sync_address: Option<IpAddr>,
+    pub sync_error: Option<String>,
+    /// True while the sync window shows.
+    pub sync_open: bool,
     /// Counts changes to the library's songs and tags, so work that depends on them knows
     /// when to start again.
     pub library_revision: u64,
@@ -364,8 +387,11 @@ impl App {
     ) -> Self {
         theme::install(&ctx);
         let (events, scan_events) = mpsc::channel();
+        let (sync_sender, sync_events) = mpsc::channel();
         let covers = Covers::new(&ctx);
         let saved_folder = settings.folder.clone();
+        let (shuffle, repeat) = (settings.shuffle, settings.repeat);
+        let saved_queue = settings_path.as_deref().map(Settings::queue_path).and_then(|path| SavedQueue::load(&path));
         let spotify = SpotifyPage::new(&ctx, settings.spotify_client.as_deref(), settings.spotify_token.as_deref());
         let mut app = Self {
             ctx,
@@ -374,8 +400,8 @@ impl App {
             queue: None,
             minimized: true,
             card_tab: CardTab::Lyrics,
-            shuffle: false,
-            repeat: false,
+            shuffle,
+            repeat,
             settings,
             settings_path,
             roots: Vec::new(),
@@ -415,6 +441,14 @@ impl App {
             paste_lyrics_until: None,
             spotify,
             spotify_open: false,
+            saved_queue,
+            queue_saved_at: None,
+            sync: None,
+            sync_sender,
+            sync_events,
+            sync_address: None,
+            sync_error: None,
+            sync_open: false,
             library_revision: 0,
             window_title: APP_NAME.to_owned(),
             #[cfg(windows)]
@@ -429,7 +463,70 @@ impl App {
             let roots = vec![folder.clone()];
             app.load_library(vec![folder], LoadKind::Open { autoplay: false, roots, folder: None });
         }
+        if app.settings.sync {
+            app.start_sync();
+        }
         app
+    }
+
+    /// Listens for phones on every network of the computer.
+    fn start_sync(&mut self) {
+        let ctx = self.ctx.clone();
+        let server = SyncServer::start(
+            Ipv4Addr::UNSPECIFIED.into(),
+            sync::PORT,
+            self.settings.folder.clone(),
+            self.settings.sync_keys.clone(),
+            self.sync_sender.clone(),
+            move || ctx.request_repaint(),
+        );
+        match server {
+            Ok(server) => {
+                self.sync = Some(server);
+                self.sync_address = sync::local_address();
+                self.sync_error = None;
+            }
+            Err(err) => {
+                self.sync = None;
+                self.sync_error = Some(format!("Could not start sync on port {}: {err}", sync::PORT));
+            }
+        }
+    }
+
+    fn set_sync(&mut self, on: bool) {
+        self.settings.sync = on;
+        self.save_settings();
+        if on {
+            self.start_sync();
+        } else {
+            self.sync = None;
+            self.sync_error = None;
+        }
+    }
+
+    fn forget_phones(&mut self) {
+        if let Some(server) = &self.sync {
+            server.forget_phones();
+        }
+        self.settings.sync_keys.clear();
+        self.save_settings();
+    }
+
+    fn poll_sync(&mut self) {
+        if let Some(server) = &self.sync {
+            // Phones sync with the saved music folder, which can change at any time.
+            server.set_root(self.settings.folder.clone());
+        }
+        while let Ok(event) = self.sync_events.try_recv() {
+            match event {
+                SyncEvent::Paired(key) => {
+                    self.settings.sync_keys.insert(key);
+                    self.save_settings();
+                    self.notify("A phone paired for sync".to_owned());
+                }
+                SyncEvent::Activity(text) => self.notify(text),
+            }
+        }
     }
 
     /// Scans on a thread, because a large folder would freeze the window. Tags arrive one
@@ -758,9 +855,65 @@ impl App {
             self.settings.folder = Some(folder);
             self.save_settings();
         }
+        // The queue of the last run comes back with the saved folder, paused where it was.
+        let saved = self.saved_queue.take();
         if autoplay {
             self.play_view(None);
             self.minimized = false;
+        } else if let Some(saved) = saved {
+            self.restore_queue(&saved);
+        }
+    }
+
+    fn restore_queue(&mut self, saved: &SavedQueue) {
+        let positions: HashMap<&Path, usize> =
+            self.library.tracks.iter().enumerate().map(|(index, track)| (track.path.as_path(), index)).collect();
+        let find = |paths: &[PathBuf]| -> Vec<usize> { paths.iter().filter_map(|path| positions.get(path.as_path()).copied()).collect() };
+        let Some(&current) = saved.tracks.get(saved.position).and_then(|path| positions.get(path.as_path())) else { return };
+        let tracks = find(&saved.tracks);
+        let original = find(saved.original());
+        let Some(position) = tracks.iter().position(|&track| track == current) else { return };
+        let playlist = saved.playlist.as_ref().and_then(|name| {
+            self.library.playlists.iter().position(|playlist| playlist.collection.is_none() && &playlist.name == name)
+        });
+        self.queue = Some(Queue { playlist, original, tracks, position });
+        self.open_at(position, Some(saved.seconds));
+    }
+
+    /// Writes the queue and how far its song played, for the next start.
+    fn save_queue(&mut self) {
+        self.queue_saved_at = Some(Instant::now());
+        let Some(path) = self.settings_path.as_deref().map(Settings::queue_path) else { return };
+        let Some(queue) = &self.queue else {
+            let _ = fs::remove_file(path);
+            return;
+        };
+        let paths = |tracks: &[usize]| -> Vec<PathBuf> { tracks.iter().map(|&track| self.library.tracks[track].path.clone()).collect() };
+        let playlist = queue
+            .playlist
+            .and_then(|index| self.library.playlists.get(index))
+            .filter(|playlist| playlist.collection.is_none())
+            .map(|playlist| playlist.name.clone());
+        let saved = SavedQueue {
+            tracks: paths(&queue.tracks),
+            original: paths(&queue.original),
+            position: queue.position,
+            seconds: self.player.as_ref().map_or(0.0, |player| player.get_pos().as_secs_f32()),
+            playlist,
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        // Losing the queue is not worth a message.
+        let _ = fs::write(path, saved.serialize());
+    }
+
+    /// Remembers shuffle and repeat for the next start.
+    fn save_modes(&mut self) {
+        if (self.settings.shuffle, self.settings.repeat) != (self.shuffle, self.repeat) {
+            self.settings.shuffle = self.shuffle;
+            self.settings.repeat = self.repeat;
+            self.save_settings();
         }
     }
 
@@ -840,6 +993,12 @@ impl App {
     }
 
     fn play_at(&mut self, position: usize) {
+        self.open_at(position, None);
+    }
+
+    /// Plays the song at `position` of the queue, or with `paused_at`, loads it paused at that
+    /// many seconds.
+    fn open_at(&mut self, position: usize, paused_at: Option<f32>) {
         self.player = None;
         self.duration = None;
         self.seek_preview = None;
@@ -854,9 +1013,13 @@ impl App {
         self.library.tracks[track].info = info.clone();
         self.lyrics = Lyrics::for_track(&path);
 
-        let started = self.start(&path, false);
+        let started = self.start(&path, paused_at.is_some());
         self.tech = tech_lines(&path, &info, started.as_ref().ok().copied(), self.duration);
         self.error = started.err().map(|err| format!("{}: {err}", info.title));
+        if let Some(seconds) = paused_at.filter(|&seconds| seconds > 0.0) {
+            self.seek(seconds);
+        }
+        self.save_queue();
     }
 
     fn restart_marquee(&mut self) {
@@ -941,7 +1104,10 @@ impl App {
                 // The PC may have slept while the track was paused.
                 self.check_output_device(true);
             }
-            Some(player) => player.pause(),
+            Some(player) => {
+                player.pause();
+                self.save_queue();
+            }
             None => match &self.queue {
                 Some(queue) => self.play_at(queue.position),
                 None => self.play_view(None),
@@ -1213,6 +1379,7 @@ impl App {
             Action::PlayView => self.play_view(None),
             Action::ShufflePlayView => {
                 self.shuffle = true;
+                self.save_modes();
                 self.play_view(None);
             }
             Action::PlayQueue(position) => self.play_at(position),
@@ -1270,12 +1437,23 @@ impl App {
                 self.save_settings();
             }
             Action::ToggleLike => self.toggle_like(),
-            Action::ToggleShuffle => self.toggle_shuffle(),
-            Action::ToggleRepeat => self.repeat = !self.repeat,
+            Action::ToggleShuffle => {
+                self.toggle_shuffle();
+                self.save_modes();
+                self.save_queue();
+            }
+            Action::ToggleRepeat => {
+                self.repeat = !self.repeat;
+                self.save_modes();
+            }
             Action::OpenFolder => self.open_folder(),
             Action::Seek(seconds) => self.seek(seconds),
             Action::SaveSettings => self.save_settings(),
             Action::Spotify(action) => self.spotify_action(action),
+            Action::OpenSync => self.sync_open = true,
+            Action::CloseSync => self.sync_open = false,
+            Action::SetSync(on) => self.set_sync(on),
+            Action::ForgetPhones => self.forget_phones(),
         }
     }
 
@@ -1425,6 +1603,13 @@ impl App {
     /// Follows the playing audio. Runs while the window is minimized too.
     pub fn update_playback(&mut self, ctx: &egui::Context) {
         self.receive_scan_events();
+        self.poll_sync();
+        // Closing the window, from the tray or when Windows shuts down, keeps where the song was.
+        let closing = ctx.input(|input| input.viewport().close_requested());
+        let due = self.is_playing() && self.queue_saved_at.is_none_or(|saved| saved.elapsed() >= SAVE_QUEUE_EVERY);
+        if self.queue.is_some() && (closing || due) {
+            self.save_queue();
+        }
         self.covers.poll(ctx);
         self.poll_spotify(ctx);
         if self.is_playing() {

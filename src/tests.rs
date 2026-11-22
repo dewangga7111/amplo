@@ -337,6 +337,41 @@ fn repeat_plays_the_same_track_again() {
 }
 
 #[test]
+fn shuffle_and_repeat_stay_as_they_were_after_a_restart() {
+    let folder = TestFolder::new("modes");
+    let settings_path = folder.0.join("state.txt");
+    let mut harness = harness_with(&folder, silent_settings(), Some(settings_path.clone()));
+    harness.state_mut().apply(Action::ToggleShuffle);
+    harness.state_mut().apply(Action::ToggleRepeat);
+    let saved = Settings::parse(&fs::read_to_string(&settings_path).unwrap());
+    assert!(saved.shuffle && saved.repeat);
+    drop(harness);
+
+    let again = harness_with(&folder, saved, Some(settings_path.clone()));
+    assert!(again.state().shuffle && again.state().repeat);
+}
+
+#[test]
+fn the_queue_comes_back_paused_after_a_restart() {
+    let folder = TestFolder::new("queue");
+    let settings_path = folder.0.join("state.txt");
+    let mut harness = harness_with(&folder, silent_settings(), Some(settings_path.clone()));
+    click(&mut harness, "3. c long");
+    harness.state_mut().apply(Action::Seek(5.0));
+    harness.state_mut().apply(Action::Toggle);
+    assert!(is_paused(&harness));
+    drop(harness);
+
+    let mut again = harness_with(&folder, silent_settings(), Some(settings_path.clone()));
+    wait_until(&mut again, "restored queue", |app| app.player.is_some());
+    assert_eq!(current_title(&again), "c long");
+    assert!(is_paused(&again));
+    assert!(position(&again) >= 4.5, "the song starts where it was");
+    let queue = again.state().queue.as_ref().unwrap();
+    assert_eq!((queue.position, queue.tracks.len(), queue.playlist), (2, 4, Some(ALL_SONGS)));
+}
+
+#[test]
 fn like_saves_and_fills_the_liked_playlist() {
     let folder = TestFolder::new("like");
     let settings_path = folder.0.join("state.txt");
@@ -668,6 +703,19 @@ fn a_playlist_cover_shows_and_can_be_removed() {
     assert!(harness.query_by_label_contains("Change the cover").is_none());
 }
 
+#[test]
+fn the_phone_button_opens_the_sync_window_without_starting_sync() {
+    let folder = TestFolder::new("sync-window");
+    let mut harness = harness_for(&folder);
+    click(&mut harness, "Sync with phone");
+    assert!(harness.state().sync_open);
+    assert!(harness.query_by_label("Let phones sync with this computer").is_some());
+    // Sync stays off until the user turns it on, so no port opens.
+    assert!(harness.state().sync.is_none());
+    click(&mut harness, "Done");
+    assert!(!harness.state().sync_open);
+}
+
 /// Saves pictures of each screen, to compare with the design by eye. Set `AMPLO_RENDER_DIR`
 /// for the output and `AMPLO_RENDER_LIBRARY` for a real music folder. Stays silent at volume 0.
 #[test]
@@ -786,6 +834,27 @@ fn render_screens() {
     harness.state_mut().new_playlist.as_mut().unwrap().name = "Late Night".to_owned();
     settle(&mut harness, "new-playlist");
     harness.state_mut().new_playlist = None;
+    // Sync on, with a server that only this computer can reach.
+    let (events, _received) = std::sync::mpsc::channel();
+    let server = amplo::sync::SyncServer::start(
+        std::net::Ipv4Addr::LOCALHOST.into(),
+        0,
+        Some(folder.0.clone()),
+        std::collections::BTreeSet::new(),
+        events,
+        || {},
+    )
+    .unwrap();
+    harness.state_mut().sync = Some(server);
+    harness.state_mut().settings.sync = true;
+    harness.state_mut().settings.folder = Some(PathBuf::from("G:\\Music"));
+    harness.state_mut().sync_address = Some(std::net::Ipv4Addr::new(192, 168, 1, 20).into());
+    harness.state_mut().apply(Action::OpenSync);
+    settle(&mut harness, "sync");
+    harness.state_mut().apply(Action::CloseSync);
+    harness.state_mut().sync = None;
+    harness.state_mut().settings.sync = false;
+    harness.state_mut().settings.folder = None;
     harness.state_mut().library.playlists.pop();
     let playlists = harness.state().library.playlists.len();
     harness.state_mut().apply(Action::OpenPlaylist(playlists - 1));

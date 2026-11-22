@@ -7,4 +7,5 @@ mod opus;
 pub mod settings;
 pub mod spectrum;
 pub mod spotify;
+pub mod sync;
 pub mod watch;
